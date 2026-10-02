@@ -1,6 +1,6 @@
 # dsh-context-truth
 
-[English](README.en.md) · [简体中文](README.md)
+[English](README-en.md) · [简体中文](README.md)
 
 > Give the model its **real** context occupancy — measured by the host and re-injected every turn — and stop the false claim "context is nearly exhausted" from surviving compaction.
 
