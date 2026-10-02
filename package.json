@@ -1,0 +1,57 @@
+{
+  "name": "dsh-context-truth",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: tells the model its real, host-measured context occupancy every turn — and keeps compaction summaries from carrying false \"context is nearly exhausted\" claims.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "context",
+    "context-window",
+    "token-meter",
+    "compaction",
+    "runtime-context",
+    "agent"
+  ],
+  "license": "MIT",
+  "author": "deepseekv41flash<monkey321478965@outlook.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepseekv41flash/dsh-context-truth.git"
+  },
+  "homepage": "https://github.com/deepseekv41flash/dsh-context-truth#readme",
+  "bugs": {
+    "url": "https://github.com/deepseekv41flash/dsh-context-truth/issues"
+  },
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "build": "bash scripts/build.sh",
+    "check": "node --input-type=module -e \"await import('./lib/index.js')\""
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,27 @@
+# dsh-context-truth bundle layer — applied automatically when a profile lists this
+# package in dsh.profile.bundles (declared by dsh.bundle.patch in package.json), or
+# inserted by hand into a profile's own cordis.patch.yml.
+#
+# Every config key is optional; the defaults are shown. Both capabilities can be
+# switched off independently.
+- insert:
+    - id: context-truth
+      name: dsh-context-truth
+      # config:
+      #   # capability 1 — the measured occupancy line
+      #   enabled: true
+      #   language: en                     # en | zh
+      #   order: 100                       # before sandbox (110) and approval (115)
+      #   quantumPercent: 5                # % of the window per display step
+      #   thresholdRatio: 0.8              # mirror of dsh-compaction-basic's policy
+      #   headroomTokens: 65536            # mirror of dsh-compaction-basic's policy
+      #   reservedCompletionTokens: null   # null = the routed request's own maxTokens
+      #   moderateAt: 0.5                  # band edges, as a fraction of the compaction point
+      #   tightAt: 0.85
+      #   hysteresis: 0.05
+      #   authoritative: true              # append the "only authority" clause
+      #   staleClaimClause: true           # retire earlier "context is nearly full" claims
+      #   logBandChanges: true
+      #   # capability 2 — the compaction directive rules
+      #   patchCompactionPrompt: true
+      #   compactionRules: []              # override the default two rules; [] disables the append
