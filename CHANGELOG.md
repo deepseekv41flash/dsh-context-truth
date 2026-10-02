@@ -16,6 +16,8 @@ First release.
   so a summary stops carrying the assistant's own guesses about its remaining budget
   forward as established background.
 - Zero dependencies, no build step, no tools, no client bundle.
+- Bilingual docs: `README.md` (简体中文) and `README.en.md` (English), switched by the
+  language line under the title.
 - Mounting twice in one scope (bundle assembly plus a runtime injection of the same
   package) leaves the second instance inert instead of failing.
 - 21 unit tests: banding, hysteresis, quantization, conservative headroom, degradation on a

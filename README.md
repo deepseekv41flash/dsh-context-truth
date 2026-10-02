@@ -1,5 +1,7 @@
 # dsh-context-truth
 
+[English](README.en.md) · [简体中文](README.md)
+
 > 让模型知道自己**真实的**上下文占用——每轮由宿主实测回填，并且不让"上下文快用完了"这句错话被压缩摘要继承下去。
 
 DSH（DeepSeek Harness）插件 · 零依赖 · 零工具 · 零 UI · 免构建 · MIT
@@ -127,7 +129,7 @@ runtime-context 快照**字节不变就不会重发**，所以读数按台阶量
 ## 验证
 
 ```sh
-npm test          # 19 项单测：分档/迟滞/量化/降级/摘要改写/幂等
+npm test          # 21 项单测：分档/迟滞/量化/降级/摘要改写/幂等/重复挂载
 ```
 
 装好后开一个新会话发一条消息，展开该轮的 runtime context 块应看到
@@ -137,18 +139,6 @@ npm test          # 19 项单测：分档/迟滞/量化/降级/摘要改写/幂�
 ## 卸载
 
 从 profile patch / bundles 里删掉那一行即可，重启即净——没有工具、没有客户端、没有落盘状态。
-
-## English
-
-**dsh-context-truth** gives a DeepSeek Harness agent the one fact it cannot measure for itself:
-how full its context actually is. A single dynamic runtime-context line, rendered from the
-host's own token meter (`tokenMeter.measure`), re-injected only when the reading moves a
-display step. It also extends the compaction directive — through the public `llm/stream`
-waterfall, tail-only so the cached prefix is untouched — so summaries stop carrying the
-model's own guesses about its remaining budget forward as established background.
-
-Install: `dsh plugin --profile web add dsh-context-truth`. Zero dependencies, no build step,
-no tools, no UI. MIT.
 
 ## License
 
