@@ -1,0 +1,5 @@
+# Normalize every text file to LF, in the repository and in the working tree.
+# Without this, a Windows checkout with core.autocrlf=true rewrites files to CRLF,
+# which changes the bytes npm packs (0.1.3 drifted by 17 bytes exactly this way):
+# the tarball hash only reproduced after `git -c core.autocrlf=false checkout`.
+* text=auto eol=lf
