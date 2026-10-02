@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { apply, internals, name, inject, CONTEXT_NAME, VARIABLE_NAME } from '../lib/index.js'
 
-const { resolveOptions, readOccupancy, settleBand, quantize, quantizeHeadroom, render, patchCompactionInstruction, patchCompactionRequest, isCompactionRequest, messageText, DEFAULT_OPTIONS } = internals
+const { resolveOptions, readOccupancy, settleBand, quantize, quantizeHeadroom, headroomDisplayStep, render, patchCompactionInstruction, patchCompactionRequest, isCompactionRequest, isTaggedCompactionRequest, messageText, DEFAULT_OPTIONS, DEFAULT_COMPACTION_RULES } = internals
 
 /** A 1M window reserving the DeepSeek adapter's default 256K completion tokens. */
 const WINDOW = 1000000
@@ -328,4 +328,135 @@ test('the rules can be replaced or switched off', () => {
   apply(ctx, { patchCompactionPrompt: false })
   assert.equal(registered.listeners['llm/stream'], undefined)
   assert.ok(registered.variable, 'the measured line stays installed')
+})
+
+test('a request that merely quotes the directive is not a compaction call', () => {
+  const rules = resolveOptions({}).compactionRules
+  // The shape that produced a false positive in the wild: an ordinary user turn
+  // whose trailing tool result dumped the engine's own directive text.
+  const lookAlike = {
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'grep the engine for the marker' }] },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `--- hit#1 type=tool/result at=1200/9000\n${INSTRUCTION}\n--- total hits: 10`,
+          },
+        ],
+      },
+    ],
+  }
+  assert.equal(isCompactionRequest(lookAlike), false)
+  assert.equal(patchCompactionRequest(lookAlike, rules), false)
+  assert.equal(messageText(lookAlike.messages.at(-1)).includes(rules[0]), false, 'nothing was appended')
+
+  const quoted = {
+    messages: [{ role: 'user', content: [{ type: 'text', text: `grep output: ${INSTRUCTION}` }] }],
+  }
+  assert.equal(isCompactionRequest(quoted), false)
+  assert.equal(isTaggedCompactionRequest(quoted), false)
+})
+
+test('a caller tag is authoritative in both directions', () => {
+  const rules = resolveOptions({}).compactionRules
+  // Tagged as something else: never the compaction call, even though the trailing
+  // message is the directive verbatim.
+  const other = { ...compactionRequest(), purpose: 'session-title' }
+  assert.equal(isCompactionRequest(other), false)
+  assert.equal(patchCompactionRequest(other, rules), false)
+  assert.equal(messageText(other.messages.at(-1)).includes(rules[0]), false)
+
+  // Untagged: a directive-shaped tail is still recognised, so an engine that sets
+  // no purpose at all keeps working.
+  const untagged = compactionRequest()
+  delete untagged.purpose
+  assert.equal(isCompactionRequest(untagged), true)
+  assert.equal(isTaggedCompactionRequest(untagged), false)
+  assert.equal(patchCompactionRequest(untagged, rules), true)
+  assert.ok(messageText(untagged.messages.at(-1)).includes(rules[0]))
+
+  // A tagged call with no messages has nothing to patch.
+  assert.equal(isCompactionRequest({ purpose: 'compaction', messages: [] }), false)
+  assert.equal(isCompactionRequest({ purpose: 'compaction', messages: 'not an array' }), false)
+})
+
+test('a look-alike can no longer spend the one-shot warning', () => {
+  const { ctx, registered } = stubContext({ used: 100000 })
+  const warnings = []
+  ctx.logger = { warn: (message) => warnings.push(message), info: () => {} }
+  apply(ctx, {})
+  const stream = registered.listeners['llm/stream']
+  const next = () => 'stream'
+
+  // An ordinary request with a frozen envelope that quotes the directive. This is
+  // exactly what burned the warning in the wild, and it must stay silent.
+  const lookAlike = Object.freeze({
+    messages: Object.freeze([
+      Object.freeze({ role: 'user', content: Object.freeze([{ type: 'text', text: `excerpt: ${INSTRUCTION}` }]) }),
+    ]),
+  })
+  assert.equal(stream(lookAlike, next), 'stream')
+  assert.deepEqual(warnings, [], 'a look-alike must not warn')
+
+  // A genuine tagged call it cannot patch: warns, exactly once.
+  assert.equal(stream(Object.freeze(compactionRequest()), next), 'stream')
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /could not extend the compaction directive/)
+  stream(Object.freeze(compactionRequest()), next)
+  assert.equal(warnings.length, 1, 'the warning stays one-shot')
+})
+
+test('a reading below one display step says so instead of rendering zero', () => {
+  const { ctx, registered } = stubContext({ used: 35000 })
+  apply(ctx, {})
+  const line = lineFor(registered, stubSession())
+  assert.match(line, /Context occupancy \(host-measured\): under 50K \/ 1\.00M tokens used \(under 5%\)/)
+  assert.doesNotMatch(line, /: 0 \/ 1\.00M/, 'a sub-step reading must never render as an empty window')
+  // The line must not contradict itself: 643K of real headroom, floored to 600K.
+  assert.match(line, /About 600K tokens of headroom remain/)
+})
+
+test('an empty session still reads a true zero, and Chinese floors the same way', () => {
+  const empty = stubContext({ used: 0 })
+  apply(empty.ctx, {})
+  assert.match(lineFor(empty.registered, stubSession()), /: 0 \/ 1\.00M tokens used \(0%\)/)
+
+  const zh = stubContext({ used: 35000 })
+  apply(zh.ctx, { language: 'zh' })
+  assert.match(lineFor(zh.registered, stubSession()), /已用 不足 50K \/ 1\.00M（不足 5%）/)
+})
+
+test('a floored headroom names its own step instead of claiming less than 1K', () => {
+  const options = resolveOptions({})
+  // 2464 floors to one full step; only a reading inside the step floors to zero.
+  assert.equal(headroomDisplayStep(2464, WINDOW, options), 2000)
+  assert.equal(quantizeHeadroom(2464, WINDOW, options), 2000)
+  assert.equal(quantizeHeadroom(1500, WINDOW, options), 0)
+  const rendered = render(
+    'tight',
+    {
+      quantized: 650000,
+      step: 50000,
+      used: 676000,
+      window: WINDOW,
+      threshold: THRESHOLD,
+      percent: 65,
+      headroom: 0,
+      headroomRaw: 1500,
+      headroomStep: 2000,
+    },
+    options,
+  )
+  assert.match(rendered, /Under 2K tokens of headroom remain before it\./)
+  assert.doesNotMatch(rendered, /less than 1K/)
+})
+
+test('the first rule forbids quoting a budget claim and embeds none itself', () => {
+  const rule = DEFAULT_COMPACTION_RULES[0]
+  assert.match(rule, /not even quoted, paraphrased, or listed as an example/)
+  assert.match(rule, /earlier checkpoint already carries one/)
+  assert.equal(rule.includes('"'), false, 'the rule must not hand the model a quotable false claim')
+  assert.match(DEFAULT_COMPACTION_RULES[1], /whose only justification was context pressure/)
 })

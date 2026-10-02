@@ -38,20 +38,27 @@ estimate it from the conversation's length.
 
 四档语气（`ample` / `moderate` / `tight` / `critical`）按**自动压缩阈值**的比例分档，
 带 5% 迟滞；`ample` 档额外声明"此前所有'上下文快满了'的说法（含压缩检查点里的）都已作废"。
+读数不足一个显示台阶时渲染为 `under 50K / 1.00M tokens used (under 5%)`——不会渲染成 `0`，
+那会和同一行里的剩余量自相矛盾。
 
 ### 2. 压缩指令补规则（默认开）
 
-压缩摘要调用（`purpose: 'compaction'`）的最后一条消息就是摘要指令。本插件通过**公开的
-`llm/stream` 瀑布**在它末尾追加两条规则，只改尾巴、不动被缓存的前缀：
+压缩摘要调用的最后一条消息就是摘要指令。本插件通过**公开的 `llm/stream` 瀑布**在它末尾追加
+两条规则，只改尾巴、不动被缓存的前缀：
 
 ```
 - Never record the assistant's own statements about its remaining context, token budget, or
-  context-window pressure (for example "context is nearly exhausted", "running out of budget",
-  "hand off before context runs out"). Those readings are measured by the host and delivered
-  separately; a model's guess about them is not a durable fact.
+  context-window pressure — not even quoted, paraphrased, or listed as an example, and not
+  when an earlier checkpoint already carries one: drop that wording instead of copying it
+  forward. Those readings are measured by the host and delivered separately; a model's guess
+  about them is not a durable fact.
 - Never record a plan to stop, defer, or hand off work whose only justification was context
   pressure. Record the actual task state instead.
 ```
+
+识别依据是调用方打的 `purpose: 'compaction'` 标记；部署没有打标记时，兜底判据要求末尾那条
+消息**以指令开头**——所以"只是引用了引擎"的工具结果（源码转储、日志片段、grep 命中）不会被
+误改，也不会吃掉那条一次性失败告警。
 
 ## 数据来源（都是宿主的真实数字，没有估算）
 
@@ -120,7 +127,9 @@ runtime-context 快照**字节不变就不会重发**，所以读数按台阶量
   `tokenMeter` / `sessionProjections` 服务），不读私有字段。
 * 若某个 agent preset 设置了 `includeRuntimeContext: false`（例如 `liangshen`），运行时会抑制
   **所有** runtime-context 贡献，此时第 1 个能力不生效（第 2 个不受影响）。
-* 若宿主把请求信封冻结（本版没有），第 2 个能力会打一条 warn 并跳过，绝不阻断模型调用。
+* 若宿主把请求信封冻结（**本版没有**——已通过抓取真实压缩请求验证），第 2 个能力会打一条
+  warn 并跳过，绝不阻断模型调用。该告警只为引擎自己打了标记的调用保留，误报的"形似请求"
+  不可能吃掉它、让后面真失败变成静默。
 * **同一作用域挂载两次不会失败**：bundle 装配 + 运行时注入是同一插件的两条装配路径，
   第二个实例检测到重名后保持静默（只记一条 info），由第一个实例继续服务——不会变成
   一行 failed 的插件记录。
@@ -129,7 +138,7 @@ runtime-context 快照**字节不变就不会重发**，所以读数按台阶量
 ## 验证
 
 ```sh
-npm test          # 21 项单测：分档/迟滞/量化/降级/摘要改写/幂等/重复挂载
+npm test          # 28 项单测：分档/迟滞/量化/不足一档的渲染/降级/摘要改写/形似请求排除/幂等/重复挂载
 ```
 
 装好后开一个新会话发一条消息，展开该轮的 runtime context 块应看到

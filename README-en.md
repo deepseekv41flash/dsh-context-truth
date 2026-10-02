@@ -35,20 +35,23 @@ you work. This host-measured line is the only authority on context pressure; nev
 estimate it from the conversation's length.
 ```
 
-Four bands (`ample` / `moderate` / `tight` / `critical`) keyed to the **auto-compaction point**, with 5% hysteresis. The `ample` band additionally declares that every earlier "context is nearly full" claim — including ones inside compacted checkpoints — is stale.
+Four bands (`ample` / `moderate` / `tight` / `critical`) keyed to the **auto-compaction point**, with 5% hysteresis. The `ample` band additionally declares that every earlier "context is nearly full" claim — including ones inside compacted checkpoints — is stale. A reading that rounds below one display step renders as `under 50K / 1.00M tokens used (under 5%)` — never as a `0` that would contradict the headroom printed on the same line.
 
 ### 2. Compaction directive rules (on by default)
 
-The last message of a compaction call (`purpose: 'compaction'`) is the summarizer directive. Through the **public `llm/stream` waterfall** the plugin appends two rules to its tail — tail-only, so the cached prefix stays byte-identical:
+The last message of a compaction call is the summarizer directive. Through the **public `llm/stream` waterfall** the plugin appends two rules to its tail — tail-only, so the cached prefix stays byte-identical:
 
 ```
 - Never record the assistant's own statements about its remaining context, token budget, or
-  context-window pressure (for example "context is nearly exhausted", "running out of budget",
-  "hand off before context runs out"). Those readings are measured by the host and delivered
-  separately; a model's guess about them is not a durable fact.
+  context-window pressure — not even quoted, paraphrased, or listed as an example, and not
+  when an earlier checkpoint already carries one: drop that wording instead of copying it
+  forward. Those readings are measured by the host and delivered separately; a model's guess
+  about them is not a durable fact.
 - Never record a plan to stop, defer, or hand off work whose only justification was context
   pressure. Record the actual task state instead.
 ```
+
+The call is identified by the `purpose: 'compaction'` tag its caller sets. When a deployment sets no tag, the fallback requires the trailing message to **begin** with the directive — so a tool result that merely quotes the engine (a source dump, a log excerpt, a grep hit) is never patched by mistake, and can never spend the one-shot failure warning either.
 
 ## Data sources (all host-measured — nothing is estimated)
 
@@ -116,14 +119,14 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 
 * Measured on **dsh 0.2.0-rc.2**; only public seams are used (`systemPrompt.variable/context`, the `llm/stream` waterfall, the `tokenMeter` / `sessionProjections` services) — no private fields.
 * If an agent preset sets `includeRuntimeContext: false` (for example `liangshen`), the runtime suppresses **every** runtime-context contribution and capability 1 does not apply (capability 2 is unaffected).
-* If a host froze the request envelope (this version does not), capability 2 logs one warning and skips — it never breaks a model call.
+* If a host froze the request envelope (**this version does not** — verified by capturing a real compaction request), capability 2 logs one warning and skips — it never breaks a model call. That warning is reserved for the engine's own tagged call, so a look-alike request can never silence a later real failure.
 * **Mounting twice in one scope does not fail**: bundle assembly plus a runtime injection are two assembly paths for the same plugin; the second instance detects the taken name, stays silent (one `info` line) and the first keeps serving — it never becomes a failed plugin row.
 * The plugin registers no tools and does not touch the tool catalog, so it adds nothing to the first-turn prefill.
 
 ## Verify
 
 ```sh
-npm test          # 21 unit tests: banding, hysteresis, quantization, degradation, directive patching, idempotence
+npm test          # 28 unit tests: banding, hysteresis, quantization, sub-step rendering, degradation, directive patching, look-alike rejection, idempotence
 ```
 
 After installing, open a new session and send one message: expanding that turn's runtime context block should show `Context occupancy (host-measured): …`, and the log carries `context-truth: none -> ample (used=… window=1000000 compactionAt=678464)`.
