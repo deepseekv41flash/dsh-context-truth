@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-truth",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "DeepSeek Harness plugin: tells the model its real, host-measured context occupancy every turn — and keeps compaction summaries from carrying false \"context is nearly exhausted\" claims.",
   "keywords": [
     "deepseek-harness",

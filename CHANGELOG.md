@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Maintenance release: identical code and docs to 0.1.0. Published directly because npm staged
+  0.1.1 and the registry would not accept an approval for that stage record.
+
 ## 0.1.0
 
 First release.
