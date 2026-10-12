@@ -2,38 +2,45 @@
 
 ## 0.2.0
 
-> **能力 3（空闲边界折叠）能否工作，取决于接缝由哪个后端提供、以及它是否对插件可达。**
-> 实测（`0.2.0-rc.2`）：
-> - 官方 `@deepseek-ai/dsh-compaction-basic`（base bundle 层）**不可达**——`ctx.get` /
->   `ctx.reflect.get(…, false)` / 属性访问 / 活着的 `agent.ctx` 全部取不到，声明
->   `inject: ['…','compaction']` 更会让条目**永久 pending**（插件完全不加载）。已向上游报告：
->   [deepseek-harness#9425](https://github.com/deepseek-ai/deepseek-harness/discussions/9425)。
-> - `@aiwayds/dsh-dcp` 0.13.0（profile bundle 层，与本插件同层）**可达** ✓——实测接缝由
->   `DcpEngine > BasicCompactionEngine > CompactionEngine` 提供，`ctx.compaction.compactNow()`
->   调用成功，能力 3 因此可用（本 profile 已验证）。
+> **能力 3（空闲边界折叠）能否工作，取决于接缝对插件是否可达——而"可达"取决于挂载组合，不是
+> "官方 vs 第三方"。**（这一节先后写错过两次，以下是 2026-10-12 的实测版。）
 >
-> 启动时那行诊断会写明实际后端：`context-truth: services wired (tokenMeter=… compaction=object/DcpEngine>…)`。
+> 最终设计的三条，都是实测逼出来的：
+> 1. **`inject` 只声明 `['systemPrompt','tokenMeter']`。** 声明 `compaction` 会让条目**永久
+>    pending**——插件完全不加载，第 1 个能力的占用行也一起消失。已向上游报告
+>    [deepseek-harness#9425](https://github.com/deepseek-ai/deepseek-harness/discussions/9425)。
+> 2. **服务按候选链解析，不用 `ctx.get`**：`agent.ctx` → `ctx` → 已接线服务，取第一个**真的带
+>    `compactNow`** 的（不是"第一个不是 undefined 的"——对一个本 fiber 没有的服务做属性读取会返回
+>    **诊断字符串**，早期版本把那个字符串当成"找到了"，于是引擎一直可达、折叠却永不触发）。
+> 3. **启动那行诊断只反映插件自身 ctx 的可见性**，不能用来判断折叠能否工作：本 profile 现在打印的
+>    正是 `compaction=undefined/none`，而折叠在 2026-10-12 成功跑了两次。
 >
-> **折叠请求有两条通道（`foldAtIdleMethod`）**，默认 `auto` 先命令后服务：
-> 1. **命令通道**：`ctx.commands.execute(agent, '/compact', [], signal)` —— 走**该 agent 的 realm 视图**，
->    因此落到该会话本该用的那个后端上（与人类敲 `/compact` 完全一致）。**这是原版部署唯一可行的
->    通道**（profile 层的插件注入不了 preset realm 的服务，见 #9425），也让折叠风格与会话自身一致。
-> 2. **服务通道**：`ctx.compaction.compactNow()` —— 同层有可达 provider 时（如 `@aiwayds/dsh-dcp`）
->    最直接，也是 realm 没注册 `compact` 命令时唯一的办法。
-> 命令通道失败（realm 无该命令、或拒绝）会**自动回退**到服务通道，两者都不通时只记一次说明日志。
-> 本 profile 因为装了 dcp，显式选了 `service`（确定性、零 LLM 调用），见 profile patch 注释。
+> 实测（本 profile：`dsh-dcp` **禁用**，profile patch 末尾重新启用官方
+> `@deepseek-ai/dsh-compaction-basic`）：
+> - 2026-10-12 **16:07** 与 **21:46** 两次**自动**空闲折叠均成功，日志为
+>   `folded at idle via service (headroom=46558 margin=50000)` / `(headroom=43789 …)`；触发都落在
+>   回合边界上（`turn/end` 之后 13–30 毫秒），占用分别从 631K / 634K 降到 178K / 205K。
+> - 服务通道解析到的就是官方引擎，**它会真的调用 LLM 摘要**：21:46 那次用量为输入 600 +
+>   缓存命中 633,600 + 输出 3,743（命中 **99.9%**，折叠区域 432,321 token，墙钟 21 秒）。
+> - 因此 dcp 时代的结论（"官方不可达、只有 dcp 可达"）**作废**：那是在官方后端被 dcp 的 bundle
+>   patch 整个禁用的配置下测的——引擎压根没有挂载。
 >
-> 与 dsh-dcp 的分工：它的轮数触发（`roundInterval`，默认每 50 条 assistant message、在空闲
-> 边界执行）是**活动驱动**的；本插件的触发是**压力驱动**的（余量进入窗口 5% 时、在同一个空闲
-> 边界）。任何一次折叠都会重置 dsh-dcp 的轮数时钟，所以两者不会互相打转。
+> **折叠请求有两条通道（`foldAtIdleMethod`）**：
+> 1. **命令通道**：`ctx.commands.execute(agent, '/compact', [], signal)` —— 走**该 agent 的 realm
+>    视图**，因此落到该会话本该用的那个后端上（与人类敲 `/compact` 完全一致），折叠风格与会话自身一致。
+> 2. **服务通道**：候选链里第一个带 `compactNow` 的实现，也是 realm 没注册 `compact` 命令时唯一的
+>    办法。本 profile 显式选 `service`（最可预测），实测可用。
+> 命令通道失败（realm 无该命令、或拒绝）会**自动回退**到服务通道；两者都不通时只记一次说明日志。
 >
-> 另需注意（重要，且我们一开始写错了）：dsh-dcp 的"关掉官方后端 + 接管接缝"只作用于**它自己所在
-> 的那一层**。每个 agent preset 里还有一个 `cordis:group` realm，里面**各自挂着一份官方
-> `compaction-basic`（LLM 摘要）+ `command-compact`**（preset 文件里连 `tokenMeter` 留在宿主、
-> `compaction` 放进 realm 都是有注释的刻意设计）。于是同一个进程里可能同时存在两个后端：
-> profile 层的 dcp（确定性，本文提到的空闲折叠走这条）与 realm 里的官方后端（LLM，`/compact`
-> 与 realm 内的自动折叠走这条）。**因此能力 2 并不是空转**——它对 realm 里那些**会调用 LLM 摘要**
-> 的折叠依然生效；只有 dcp 自己执行的确定性折叠没有摘要指令可补。
+> **与 dsh-dcp 的分工（若你挂它）**：它的轮数触发（`roundInterval`，默认每 50 条 assistant message、
+> 在空闲边界）是**活动驱动**的，本插件是**压力驱动**的（余量进入窗口 5%、在同一个空闲边界执行）；
+> 任何一次折叠都会重置它的轮数时钟，所以两者不会互相打转。本 profile 已禁用它，配置与回退配方见
+> profile patch 注释。
+>
+> **dsh-dcp 的"关掉官方后端 + 接管接缝"只作用于它自己所在的那一层**（我们一开始也写错了）：
+> 每个 agent preset 里还有一个 `cordis:group` realm，里面**各自挂着一份** `compaction-basic` +
+> `command-compact`。所以同一进程里可能同时存在两个后端——这也正是那个坑的来源：**只关 dcp 而不
+> 重开官方 = 零后端；只开 dcp 而不删重开行 = 双后端同时注册 `compaction`。改它们必须成对。**
 
 - **Capability 3: fold at the idle boundary (`foldAtIdle`, off by default).** The host's automatic
   compaction only fires when the meter *crosses* the point, and the behaviour a model adopts as it
@@ -83,17 +90,26 @@
   said so: `foldAtIdle is enabled but no compaction service is mounted; not folding`. `ctx.get(name)`
   resolves through `ctx.reflect`, and it returned nothing for `compaction` from this plugin's context.
   The occupancy line had been quietly surviving on the `contextPressure` projection fallback.
-- **The second design failed too, and the third one has a working precedent.** `ctx.inject(['compaction'], cb)`
-  never ran its callback (a second live trigger at 16:56 the next day logged the same warning). The
-  service is now reached the way `dsh-command-compact` reaches it: declare it,
-  `inject = ['systemPrompt', 'tokenMeter', 'compaction']`, then read `ctx.compaction` — and two manual
-  `/compact` runs in the same profile (10-09 and 10-10, each with a `sourceCommandId`, a summary and a
-  clean end) are the proof that path works. `provide` registers the isolate symbol on the root but
-  stores the implementation in the *providing* context's store, so a sibling entry is reachable only
-  through cordis injection. Services are still resolved **per use**, never snapshotted, and a one-line
-  startup diagnostic reports what was wired. Cost: both services are now required, and
-  `@deepseek-ai/dsh-base` mounts both (`token-meter`, `compaction-basic`); a profile that mounts neither
-  will not load this plugin.
+- **The wiring went through three designs; the first two are recorded here because their failure modes
+  are the trap.** (1) `ctx.get('compaction')` returned nothing — a service is not reached that way, and
+  the occupancy line had been quietly surviving on the `contextPressure` projection fallback. (2)
+  `ctx.inject(['compaction'], cb)` never ran its callback, and **declaring `compaction` in `inject`
+  left the entry pending forever** — the plugin did not load at all, taking capability 1 with it.
+  (3) the shipped design: `inject` stays `['systemPrompt','tokenMeter']`, and the fold resolves the
+  service through a **ranked candidate chain** (`agent.ctx` → `ctx` → wired service), taking the first
+  candidate that **actually carries `compactNow`** — never "the first that is not undefined", because
+  a property read for a service this fiber does not have answers with a **diagnostic string**. Services
+  are resolved **per use**, never snapshotted, and a one-line startup diagnostic reports what the
+  plugin's own context can see. Measured 2026-10-12: two automatic idle folds resolved the official
+  engine through that chain and completed (16:07 and 21:46) while the startup line printed
+  `compaction=undefined/none` — so the diagnostic is not a readiness check for capability 3.
+- **Capability 2 rides the seam, byte-for-byte.** Captured on both 2026-10-12 folds: the trailing
+  directive on the wire is the patched one — **2,336 characters** (1,802 original + 534 of rules), all
+  three rule markers present, and the request lands **19 ms** after `compaction-cache: aligned` logs the
+  same call (21:46:08.085 / .104) — two plugins cross-validating each other on the same `llm/stream`
+  waterfall. The patched trailing message is **not frozen** (the plugin replaces the array slot, so the
+  engine's `deepFreeze` on the appended message does not apply). Cost: **+534 characters ≈ +134 tokens
+  (+0.09%)**, appended *after* the cached prefix, so that is the only fresh full-price input a fold adds.
 - Five more tests (49 total): the idle fold's trigger and its guards (running agent, calm session,
   in-flight attempt, missing service, rejected call), the pure decision function it is built on, the
   wiring that delivers the service, a reference cell flipped at runtime to prove a settings change

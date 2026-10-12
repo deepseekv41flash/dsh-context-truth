@@ -65,7 +65,11 @@ The last message of a compaction call is the summarizer directive. Through the *
 
 The call is identified by the `purpose: 'compaction'` tag its caller sets. When a deployment sets no tag, the fallback requires the trailing message to **begin** with the directive — so a tool result that merely quotes the engine (a source dump, a log excerpt, a grep hit) is never patched by mistake, and can never spend the one-shot failure warning either.
 
-### 3. Fold at the idle boundary (optional, **off by default**; whether it can work depends on the backend being reachable)
+**Measured (2026-10-12, two automatic folds in a long session)**: the request carried the **patched** directive — 2,336 characters on the wire (1,802 original + 534 of rules), all three rule markers present, and the request landed on the same seam **19 ms** after `compaction-cache: aligned` logged the same call (21:46:08.085 / 21:46:08.104) — two plugins cross-validating each other. Related confirmation: the patched trailing message is **not frozen**, because the plugin replaces the array slot rather than mutating the frozen object the engine appends.
+
+**Cost**: the directive grows from 1,802 to 2,336 characters — **+534 characters ≈ +134 tokens (+0.09%)**. It is appended *after* the cached prefix, so those 134 tokens are the only fresh full-price input a fold adds.
+
+### 3. Fold at the idle boundary (optional, **off by default**; when it fires it resolves a `compactNow` provider through a ranked candidate chain)
 
 The host's automatic compaction is a *crossing* trigger, and the behaviour a model adopts near the point — batching round trips, avoiding risky edits, stopping mid-iteration to commit WIP — is exactly what keeps the reading below it. Measured on one live session:
 
@@ -112,7 +116,9 @@ Or write the row into a profile's own patch layer:
 
 The package ships `dsh.bundle.patch`, so listing it in a profile's `dsh.profile.bundles` assembles it too. **No build step**: `lib/index.js` is both the source and the artifact.
 
-**Two host services are hard requirements**: `inject = ['systemPrompt', 'tokenMeter', 'compaction']`. They are not optional — cordis wires a service only into a context that declares the injection (`provide` stores the implementation in the providing context's store, so sibling entries cannot see each other), so an undeclared service simply cannot be read. `@deepseek-ai/dsh-base` mounts both (`token-meter`, `compaction-basic`), which every standard deployment has; a custom profile that mounts only one of them will not load this plugin.
+**Host requirements**: `inject = ['systemPrompt', 'tokenMeter']` — **two**. `compaction` is *deliberately not declared*: declaring it left the entry **pending forever** (the plugin did not load at all, taking capability 1's occupancy line with it). Reported upstream as [#9425](https://github.com/deepseek-ai/deepseek-harness/discussions/9425).
+
+Capability 3 resolves its engine itself, at fold time, through a **ranked candidate chain** — `agent.ctx` → `ctx` → wired service — taking the first candidate that **actually carries `compactNow`** (never simply "the first that is not undefined": a property read for a service this fiber does not have answers with a **diagnostic string**, which is a trap this plugin fell into once). So the startup line `compaction=undefined/none` reports **only what the plugin's own context can see — it does not mean folding is unavailable**: this profile prints exactly that, and both automatic folds on 2026-10-12 completed.
 
 ## Configuration (every key optional)
 
@@ -141,7 +147,7 @@ The package ships `dsh.bundle.patch`, so listing it in a profile's `dsh.profile.
 | `compactionRules` | see above | Rule array; `[]` disables capability 2 |
 | `foldAtIdle` | `false` | Enable capability 3 (fold at the idle boundary) |
 | `foldAtIdleMarginPercent` | `5` | Fold once the headroom is within this percent of the window (50K on a 1M window) |
-| `foldAtIdleMethod` | `auto` | Channel for the request: `auto` runs the session's own `/compact` first (realm view — works on a stock deployment) and falls back to the service; `command` / `service` force one |
+| `foldAtIdleMethod` | `auto` | Channel for the request: `auto` runs the session's own `/compact` first (realm view), then falls back to the ranked service chain; `command` / `service` force one. `service` is the most predictable of the two (this profile uses it) |
 | `foldAtIdleCooldownMs` | `60000` | Minimum gap between attempts, so a failure cannot hammer the engine |
 
 **Configuration goes in the profile patch** — the same place `subagent`'s `maxDepth` and `bash-terminal`'s `defaultShell` live:

@@ -104,7 +104,16 @@ this in as few commands as possible, then a short answer."。数字它读对了�
 消息**以指令开头**——所以"只是引用了引擎"的工具结果（源码转储、日志片段、grep 命中）不会被
 误改，也不会吃掉那条一次性失败告警。
 
-### 3. 空闲边界折叠（可选，**默认关**；能否工作取决于压缩后端是否对插件可达）
+**实测（2026-10-12，长会话两次自动折叠）**：压缩请求里带上的是**补丁后**的指令，采集到的尾部
+指令 **2,336 字符**（原指令 1,802 + 两条规则 534），三条规则特征串全部命中；同一时刻接缝上
+`compaction-cache: aligned` 那行与本插件的请求相隔 **19 毫秒**（21:46:08.085 / 21:46:08.104），
+两个插件互为交叉验证。附带确认：被追加的那条消息在补丁后**不是冻结对象**——本插件替换的是
+数组槽位（而非改写原对象），所以不受引擎对追加消息的 `deepFreeze` 影响。
+
+**代价**：指令从 1,802 涨到 2,336 字符，**+534 字符 ≈ +134 token（+0.09%）**；因为只加在
+缓存前缀**之后**，这 134 token 就是每次折叠唯一新增的全价输入。
+
+### 3. 空闲边界折叠（可选，**默认关**；触发时按候选链找带 `compactNow` 的实现）
 
 宿主的自动压缩是一个**"跨过阈值"**触发器，而模型在临近阈值时的行为——合并往返、回避高风险改动、
 改到一半就提交 WIP——**恰好使读数永远停在阈值下面**。实测一个长会话：
@@ -152,10 +161,15 @@ dsh plugin --profile web add dsh-context-truth
 本包带 `dsh.bundle.patch`，作为 bundle 列进 profile 的 `dsh.profile.bundles` 也会自动装配。
 **不需要构建**：`lib/index.js` 同时是源码和产物。
 
-**两项宿主服务是硬依赖**：`inject = ['systemPrompt', 'tokenMeter', 'compaction']`。这不是可选的——
-cordis 只把服务接线给**声明了注入**的 context（`provide` 把实现存在提供者的 store 里，同级条目
-互相看不见），所以不声明就取不到。两个服务都由 `@deepseek-ai/dsh-base` 挂载（`token-meter`、
-`compaction-basic`），标准部署都有；只挂其中之一的定制 profile 下本插件不会加载。
+**宿主要求**：`inject = ['systemPrompt', 'tokenMeter']` —— **两个**。`compaction` 是**刻意不声明**的：
+声明它会让条目**永久 pending**（插件完全不加载，第 1 个能力的占用行也一起消失），已向上游报告
+[#9425](https://github.com/deepseek-ai/deepseek-harness/discussions/9425)。
+
+第 3 个能力在折叠时自己按**候选链**去找引擎：`agent.ctx` → `ctx` → 已接线服务，取第一个**真的带
+`compactNow`** 的实现（不是"第一个不是 undefined 的"——对一个本 fiber 没有的服务做属性读取会返回
+**诊断字符串**而不是 `undefined`，这是踩过的坑）。所以启动诊断里那行
+`compaction=undefined/none` **只反映插件自身 ctx 的可见性，不代表折叠不可用**：本 profile 现在
+打印的就是 `undefined/none`，而 2026-10-12 的两次自动折叠都成功完成了。
 
 ## 配置（全部可选）
 
@@ -184,7 +198,7 @@ cordis 只把服务接线给**声明了注入**的 context（`provide` 把实现
 | `compactionRules` | 见上 | 规则数组；`[]` 关闭本能力 |
 | `foldAtIdle` | `false` | 是否启用第 3 个能力（空闲边界折叠） |
 | `foldAtIdleMarginPercent` | `5` | 余量 ≤ 窗口的百分之几时触发（1M 窗口 = 50K） |
-| `foldAtIdleMethod` | `auto` | 折叠请求通道：`auto`＝先走该会话的 `/compact`（realm 视图，原版可用）再回退服务；`command`／`service` 强制其一 |
+| `foldAtIdleMethod` | `auto` | 折叠请求通道：`auto`＝先走该会话的 `/compact`（realm 视图）再回退到服务候选链；`command`／`service` 强制其一。`service` 是最可预测的一档（本 profile 用它） |
 | `foldAtIdleCooldownMs` | `60000` | 两次尝试之间的最小间隔（失败也不会反复撞引擎） |
 
 **配置写在 profile patch 里**（`subagent` 的 `maxDepth`、`bash-terminal` 的 `defaultShell` 都是这样生效的）：
