@@ -1,5 +1,7 @@
 # dsh-context-truth
 
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/deepseekv41flash/dsh-context-truth)
+
 [English](README-en.md) · [简体中文](README.md)
 
 > 让模型知道自己**真实的**上下文占用——每轮由宿主实测回填，并且不让"上下文快用完了"这句错话被压缩摘要继承下去。
