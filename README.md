@@ -1,8 +1,10 @@
 # dsh-context-truth
 
-[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/deepseekv41flash/dsh-context-truth)
-
 [English](README-en.md) · [简体中文](README.md)
+
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/deepseekv41flash/dsh-context-truth)
+[![npm](https://img.shields.io/npm/v/dsh-context-truth.svg)](https://www.npmjs.com/package/dsh-context-truth)
+[![license](https://img.shields.io/npm/l/dsh-context-truth.svg)](./LICENSE)
 
 > 让模型知道自己**真实的**上下文占用——每轮由宿主实测回填，并且不让"上下文快用完了"这句错话被压缩摘要继承下去。
 

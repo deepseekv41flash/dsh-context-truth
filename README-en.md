@@ -2,6 +2,10 @@
 
 [English](README-en.md) · [简体中文](README.md)
 
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/deepseekv41flash/dsh-context-truth)
+[![npm](https://img.shields.io/npm/v/dsh-context-truth.svg)](https://www.npmjs.com/package/dsh-context-truth)
+[![license](https://img.shields.io/npm/l/dsh-context-truth.svg)](./LICENSE)
+
 > Give the model its **real** context occupancy — measured by the host and re-injected every turn — and stop the false claim "context is nearly exhausted" from surviving compaction.
 
 A DSH (DeepSeek Harness) plugin · one peer dependency (the host's own `schemastery`) · needs the host services `tokenMeter` and `compaction` (both shipped by `dsh-base`) · 1 tool in handoff mode (`handoff_ready`) · 1 client settings card · no build step · MIT
