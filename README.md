@@ -6,7 +6,7 @@
 
 > 让模型知道自己**真实的**上下文占用——每轮由宿主实测回填，并且不让"上下文快用完了"这句错话被压缩摘要继承下去。
 
-DSH（DeepSeek Harness）插件 · 单一 peer 依赖（宿主自带的 `schemastery`）· 需要宿主服务 `tokenMeter` 与 `compaction`（标准部署的 `dsh-base` 自带）· 1 个工具（`handoff_ready`，交接式折叠用）· 1 个客户端设置卡片 · 免构建 · MIT
+DSH（DeepSeek Harness）插件 · 单一 peer 依赖（宿主自带的 `schemastery`）· 需要宿主服务 `tokenMeter` 与 `compaction`（标准部署的 `dsh-base` 自带）· handoff 模式下 1 个工具（`handoff_ready`）· 1 个客户端设置卡片 · 免构建 · MIT
 
 ---
 
@@ -283,10 +283,11 @@ runtime-context 快照**字节不变就不会重发**，所以读数按台阶量
 * **同一作用域挂载两次不会失败**：bundle 装配 + 运行时注入是同一插件的两条装配路径，
   第二个实例检测到重名后保持静默（只记一条 info），由第一个实例继续服务——不会变成
   一行 failed 的插件记录。
-* 本插件注册 **1 个工具**：`handoff_ready`（交接档登记）。它在所有模式下都会出现在工具目录里
-  （设置卡需要能随时切换模式），不产生额外调用；只有 handoff 模式会用它。工具定义很小，但仍算
-  **一次首轮 prefill** 的成本——这是本插件唯一改工具目录的地方。折叠本身不经过模型工具调用
-  （插件直接调 `compaction.compactNow()`），所以 `off`/`idle` 模式下模型侧看不到任何折叠活动。
+* 本插件**只在 `handoff` 模式下注册 1 个工具**：`handoff_ready`（交接档登记）。
+  `off` / `idle` 下它会从工具目录里移除，工具目录与没有这个能力时完全一致；切换在**下一个请求**生效
+  （插件在 `agent/request` 里对账，用的是 `tools.register()` 返回的注销 disposer）。
+  折叠本身不经过模型工具调用（插件直接调 `compaction.compactNow()`），所以 `off`/`idle` 模式下
+  模型侧看不到任何折叠活动，也没有这个工具。
 * 本插件带 **1 个客户端模块**（`lib/client.js`，插件页的设置卡）。它只读 `settings.describe()`、
   写 `settings.mutate()`，不碰工作区、不发网络请求。
 

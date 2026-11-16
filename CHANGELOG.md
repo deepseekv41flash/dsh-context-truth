@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+* **`handoff_ready` 只在 `handoff` 模式下注册。** `off` / `idle` 下它从工具目录里移除（用
+  `tools.register()` 返回的注销 disposer），切回 handoff 时在**下一个请求**重新注册；插件被销毁时
+  也会注销。`off` / `idle` 的工具目录与没有这个能力时完全一致，不再为首轮 prefill 承担一个
+  永远只会拒绝的工具定义。
+* 日志分别记 `handoff_ready registered (fold mode is handoff)` /
+  `handoff_ready removed (fold mode is <mode>)`，模式切换在日志里可见。
+* 测试：70（新增“工具跟随实时模式”用例；变异“去掉注销调用”恰好只让它失败，恢复后字节一致）。
+
 ## 0.3.0
 
 > **新增能力 3 的第二形态：交接式折叠（`foldMode: handoff`，实验性）。** 默认模式改为 `idle`

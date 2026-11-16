@@ -4,7 +4,7 @@
 
 > Give the model its **real** context occupancy — measured by the host and re-injected every turn — and stop the false claim "context is nearly exhausted" from surviving compaction.
 
-A DSH (DeepSeek Harness) plugin · one peer dependency (the host's own `schemastery`) · needs the host services `tokenMeter` and `compaction` (both shipped by `dsh-base`) · 1 tool (`handoff_ready`, used by handoff folding) · 1 client settings card · no build step · MIT
+A DSH (DeepSeek Harness) plugin · one peer dependency (the host's own `schemastery`) · needs the host services `tokenMeter` and `compaction` (both shipped by `dsh-base`) · 1 tool in handoff mode (`handoff_ready`) · 1 client settings card · no build step · MIT
 
 ---
 
@@ -207,7 +207,7 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 * If an agent preset sets `includeRuntimeContext: false` (for example `liangshen`), the runtime suppresses **every** runtime-context contribution and capability 1 does not apply (capability 2 is unaffected).
 * If a host froze the request envelope (**this version does not** — verified by capturing a real compaction request), capability 2 logs one warning and skips — it never breaks a model call. That warning is reserved for the engine's own tagged call, so a look-alike request can never silence a later real failure.
 * **Mounting twice in one scope does not fail**: bundle assembly plus a runtime injection are two assembly paths for the same plugin; the second instance detects the taken name, stays silent (one `info` line) and the first keeps serving — it never becomes a failed plugin row.
-* The plugin registers **one tool**, `handoff_ready` (register a handoff note). It is in the catalog in every mode so the settings card can switch modes at any time, but it costs nothing unless called; only handoff mode calls it. It is still one tool definition in the first-turn prefill — the only change this plugin makes to the tool catalog. Folding itself never goes through a model tool call (the plugin calls `compaction.compactNow()` directly), so in `off` / `idle` modes the model sees no folding activity at all.
+* The plugin registers **one tool only in `handoff` mode**: `handoff_ready` (register a handoff note). In `off` / `idle` it is removed from the tool catalog again, so the catalog is exactly what a deployment without this capability has; a switch lands on the **next request** (the plugin reconciles inside `agent/request` through the disposer `tools.register()` returns). Folding itself never goes through a model tool call (the plugin calls `compaction.compactNow()` directly), so in `off` / `idle` modes the model sees neither the tool nor any folding activity.
 * The plugin ships **one client module** (`lib/client.js`, the settings card). It only reads `settings.describe()` and writes `settings.mutate()`; it touches no workspace and makes no network requests.
 
 ## Verify

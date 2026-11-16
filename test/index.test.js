@@ -18,16 +18,24 @@ const THRESHOLD = 678464
 
 /** Minimal ctx capturing what the plugin registers. */
 function stubContext({ used, meter, projections, compaction, commands, logs, tools } = {}) {
-  const registered = { variable: undefined, context: undefined, listeners: {}, injections: [], tools: [], effects: [], timers: [] }
+  const registered = { variable: undefined, context: undefined, listeners: {}, injections: [], tools: [], effects: [], disposers: [], timers: [] }
   const tokenMeter = meter === undefined ? { measure: () => ({ totalTokens: used }) } : meter
   // A host always mounts the tools service, so the stub does too: without it the
   // handoff tool cannot register and every log assertion would see that warning.
+  // `register` returns the disposer a real host returns, so a test can observe the
+  // tool following a live fold-mode switch.
   const toolsService =
     tools === undefined
       ? {
           register: (definition) => {
             registered.tools.push(definition)
-            return () => {}
+            let live = true
+            return () => {
+              if (!live) return
+              live = false
+              const index = registered.tools.indexOf(definition)
+              if (index >= 0) registered.tools.splice(index, 1)
+            }
           },
         }
       : tools
@@ -82,7 +90,9 @@ function stubContext({ used, meter, projections, compaction, commands, logs, too
     effect: (callback, label) => {
       registered.effects.push(label)
       const dispose = callback()
-      return typeof dispose === 'function' ? dispose : () => {}
+      const disposer = typeof dispose === 'function' ? dispose : () => {}
+      registered.disposers.push(disposer)
+      return disposer
     },
     setInterval: (callback, ms) => {
       registered.timers.push({ callback, ms })
@@ -1283,6 +1293,38 @@ test('foldMode: absent means idle, an explicit opt-out or mode wins', () => {
   assert.equal(shouldFoldAtIdle({ used: 640000, threshold: THRESHOLD, window: WINDOW }, resolveOptions({ foldMode: 'idle' })).fold, true)
 })
 
+test('the handoff tool follows the live fold mode', async (t) => {
+  const root = scratchRoot(t)
+  const { meter } = movableMeter(600000)
+  const agent = handoffAgent(handoffSession('session-tool'))
+  const config = { foldMode: 'off', handoffDir: root }
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  const hasTool = () => registered.tools.some((definition) => definition.name === HANDOFF_TOOL_NAME)
+
+  apply(ctx, config)
+  assert.equal(hasTool(), false, 'off mode must not advertise handoff_ready')
+
+  config.foldMode = 'idle'
+  await requestStep(registered, agent, 1)
+  assert.equal(hasTool(), false, 'idle mode must not advertise handoff_ready')
+
+  config.foldMode = 'handoff'
+  await requestStep(registered, agent, 2)
+  assert.equal(hasTool(), true, 'handoff mode must register the tool on the next request')
+
+  config.foldMode = 'off'
+  await requestStep(registered, agent, 3)
+  assert.equal(hasTool(), false, 'switching away must remove it again')
+
+  // Teardown must not leave the row behind: the registration lives on the tools
+  // service's layer, so only the returned disposer (or this cleanup) removes it.
+  config.foldMode = 'handoff'
+  await requestStep(registered, agent, 4)
+  assert.equal(hasTool(), true)
+  for (const dispose of registered.disposers.slice().reverse()) dispose()
+  assert.equal(hasTool(), false, 'disposing the plugin must unregister the tool')
+})
+
 test('handoff notes live under $DSH_HOME, one directory per session, never the workspace', () => {
   const env = { DSH_HOME: join(tmpdir(), 'ct-home') }
   const base = resolveOptions({ foldMode: 'handoff' })
@@ -1708,9 +1750,20 @@ test('handoff_ready refuses everything it cannot honour', async (t) => {
     return registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
   }
 
-  // Outside handoff mode the tool exists (so the live switch has something to
-  // switch to) and refuses instead of registering anything.
-  assert.match(toolFor({}).execute({}, { agent }), /only applies in handoff fold mode/)
+  // Outside handoff mode the tool is not registered at all, so the catalog only
+  // carries what the current mode can honour.
+  assert.equal(toolFor({}), undefined, 'off must not advertise handoff_ready')
+  assert.equal(toolFor({ foldMode: 'idle' }), undefined, 'idle must not advertise handoff_ready')
+
+  // Defense in depth: a call already in flight when the mode flips must refuse
+  // rather than register against a mode that no longer wants a handoff.
+  const live = { foldMode: 'handoff', handoffDir: root }
+  const liveCtx = stubContext({ used: 600000, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(liveCtx.ctx, live)
+  const inFlight = liveCtx.registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  live.foldMode = 'off'
+  assert.match(inFlight.execute({}, { agent }), /only applies in handoff fold mode/)
+  live.foldMode = 'handoff'
 
   const tool = toolFor({ foldMode: 'handoff' })
   const notePath = handoffPathFor(root, 'session-refuse', 1)
