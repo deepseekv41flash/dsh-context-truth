@@ -10,7 +10,13 @@
   三者都保留宿主点作为兜底。中英文都覆盖。
 * README 顶部加 npm / license 徽章，顺序与 `dsh-multi-shell`、`dsh-superagent-panel` 一致
   （标题 → 语言切换 → listed/npm/license 三枚徽章 → 摘要）。
-* 测试：71（新增"注入行按模式给出触发点"用例，中英各断言）。
+* **准备提醒改走 runtime context，不再是一条用户消息。** `agent/request` 里只发布一段待渲染的提醒，
+  由本插件已经注册的 `systemPrompt` 动态上下文段（`{{...}}` 变量）在**同一个请求**里渲染成
+  `<system-reminder>` 快照；下一个请求先退役它再决策，所以仍然是“每轮最多一次”。
+  - 时序更早：`agent/request` 在同一步的上下文刷新之前触发，不必等下一次请求（`agent.inject` 是排队）。
+  - 不再伪装成用户发言：`source.kind` 是 `runtime-context` 而不是 `user`，对话里不留气泡。
+  - 轮末唤醒仍然用 `followup`：动态上下文只有在真的发生请求时才会被读到，唤醒必须开一轮。
+* 测试：72（新增“实时切模式后提醒随模式消失”用例；三处变异分别失败 3 / 4 / 5 例）。
 
 ## 0.3.1
 

@@ -1289,6 +1289,13 @@ function requestStep(registered, agent, turn, step = 1) {
   return listener({ agent, turn, step, signal: {} }, () => Promise.resolve({}))
 }
 
+/** Render the runtime-context line the plugin registered, for one agent. */
+function contextLine(registered, agent) {
+  const provider = registered.variable === undefined ? undefined : registered.variable.provider
+  assert.equal(typeof provider, 'function', 'the plugin must register a runtime-context variable')
+  return provider({ agent })
+}
+
 /** Fire the composed `agent/status` listeners at an idle boundary and settle them. */
 async function idleBoundary(registered, agent) {
   registered.listeners['agent/status']({ agent, status: 'idle' })
@@ -1442,24 +1449,28 @@ test('handoff mode folds at the round end and activates exactly one turn', async
   })
   apply(ctx, { foldMode: 'handoff', handoffDir: root, language: 'zh' })
 
-  // Below the prep point: no reminder, no tool call, nothing.
+  // Below the prep point: no reminder, no tool call, nothing. This run is
+  // Chinese, so the note path is the language-independent marker.
+  const notePath = handoffPathFor(root, 'session-happy', 1)
   await requestStep(registered, agent, 1)
+  assert.ok(!contextLine(registered, agent).includes(notePath), 'no reminder below the prep point')
   assert.equal(agent.injected.length, 0)
 
-  // Crossing it injects one reminder naming the exact path.
+  // Crossing it puts one reminder into runtime context, naming the exact path.
+  // Nothing is queued as a user message: the same request renders the notice.
   box.used = 600000
   await requestStep(registered, agent, 2, 1)
-  assert.equal(agent.injected.length, 1, 'the prep reminder must be injected')
-  const notePath = handoffPathFor(root, 'session-happy', 1)
-  const prepText = agent.injected[0].content[0].text
+  assert.equal(agent.injected.length, 0, 'the prep reminder must not be a user message')
+  const prepText = contextLine(registered, agent)
   assert.ok(prepText.includes(notePath), 'the reminder must name the exact path')
-  assert.equal(agent.injected[0].role, 'user')
-  assert.equal(agent.injected[0].source.kind, 'user')
+  assert.match(prepText, /交接式折叠 · 准备/)
 
-  // One per turn, even though the waterfall runs on every step.
+  // One per turn, even though the waterfall runs on every step: the next request
+  // retires the notice before deciding anything.
   await requestStep(registered, agent, 2, 2)
+  assert.ok(!contextLine(registered, agent).includes(notePath), 'the notice is rendered exactly once')
   await requestStep(registered, agent, 2, 3)
-  assert.equal(agent.injected.length, 1)
+  assert.ok(!contextLine(registered, agent).includes(notePath))
 
   // The tool refuses a note that does not exist yet.
   const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
@@ -1513,10 +1524,11 @@ test('a round that ends past the prep point wakes one reminder turn, bounded by 
   })
   apply(ctx, { foldMode: 'handoff', handoffDir: root })
 
-  // The mid-round reminder is queued for the next request; the model ends the
-  // round without writing a note.
+  // The mid-round reminder lands in runtime context; the model ends the round
+  // without writing a note.
   await requestStep(registered, agent, 1)
-  assert.equal(agent.injected.length, 1)
+  assert.match(contextLine(registered, agent), /handoff fold · prepare/)
+  assert.equal(agent.injected.length, 0, 'the prep reminder is not a message')
   await idleBoundary(registered, agent)
   assert.equal(folds.length, 0, 'handoff mode must not fold behind the model\'s back')
   assert.equal(agent.followed.length, 1, 'an unread reminder must wake the round instead of waiting for a human')
@@ -1530,12 +1542,13 @@ test('a round that ends past the prep point wakes one reminder turn, bounded by 
   await idleBoundary(registered, agent)
   assert.equal(agent.followed.length, 1)
 
-  // The wake round starts: the wake message is this round's reminder, so the
-  // waterfall must not stack a second copy in it.
+  // The wake round starts: the wake message IS this round's reminder, so neither
+  // channel may stack a second copy in it.
   await requestStep(registered, agent, 2)
-  assert.equal(agent.injected.length, 1, 'no duplicate reminder in the wake round')
+  assert.doesNotMatch(contextLine(registered, agent), /handoff fold · prepare/, 'no duplicate reminder in the wake round')
   await requestStep(registered, agent, 2, 2)
-  assert.equal(agent.injected.length, 1, 'and none on a later step of the same wake round')
+  assert.doesNotMatch(contextLine(registered, agent), /handoff fold · prepare/, 'and none on a later step of the same wake round')
+  assert.equal(agent.injected.length, 0)
 
   // Still no note: the budget allows one more wake, then it stops.
   await idleBoundary(registered, agent)
@@ -1691,8 +1704,8 @@ test('the activation target survives the prep that hands out the next note', asy
   apply(ctx, { foldMode: 'handoff', handoffDir: root })
 
   await requestStep(registered, agent, 1)
-  assert.equal(agent.injected.length, 1)
-  assert.ok(agent.injected[0].content[0].text.includes(handoffPathFor(root, 'session-gc', 2)))
+  assert.match(contextLine(registered, agent), /handoff fold · prepare/)
+  assert.ok(contextLine(registered, agent).includes(handoffPathFor(root, 'session-gc', 2)))
   assert.equal(existsSync(join(dir, '001.handoff.md')), true, 'the note the delivered activation points at is still there')
   assert.equal(existsSync(join(dir, '001.drill.md')), false, 'the older draft is recycled')
   assert.equal(
@@ -1858,6 +1871,24 @@ test('a note registered early waits, and a reading that collapsed releases it', 
   assert.equal(state.foldNo, 0)
 })
 
+test('a live mode switch drops the runtime-context reminder with the mode', async (t) => {
+  const root = scratchRoot(t)
+  const { meter } = movableMeter(600000)
+  const agent = handoffAgent(handoffSession('session-switch'))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  const config = { foldMode: 'handoff', handoffDir: root }
+  apply(ctx, config)
+
+  await requestStep(registered, agent, 1)
+  const notePath = handoffPathFor(root, 'session-switch', 1)
+  assert.ok(contextLine(registered, agent).includes(notePath), 'handoff mode carries the reminder')
+
+  // The settings card writes the mode live; the very next assembly must drop the
+  // handoff paragraph instead of leaking it into a mode that has no handoff.
+  config.foldMode = 'idle'
+  assert.ok(!contextLine(registered, agent).includes(notePath), 'idle mode must not carry the handoff reminder')
+})
+
 test('prep reminders are one per turn and capped per cycle', async (t) => {
   const root = scratchRoot(t)
   const { box, meter } = movableMeter(600000)
@@ -1867,11 +1898,13 @@ test('prep reminders are one per turn and capped per cycle', async (t) => {
   apply(ctx, { foldMode: 'handoff', handoffDir: root, handoffReminders: 2 })
 
   await requestStep(registered, agent, 1, 1)
+  assert.match(contextLine(registered, agent), /handoff fold · prepare/)
   await requestStep(registered, agent, 1, 2)
-  assert.equal(agent.injected.length, 1, 'one per turn')
+  assert.doesNotMatch(contextLine(registered, agent), /handoff fold · prepare/, 'one per turn')
   await requestStep(registered, agent, 2, 1)
-  assert.equal(agent.injected.length, 2, 'a new turn gets one more')
+  assert.match(contextLine(registered, agent), /handoff fold · prepare/, 'a new turn gets one more')
   await requestStep(registered, agent, 3, 1)
-  assert.equal(agent.injected.length, 2, 'the budget stops the nagging')
+  assert.doesNotMatch(contextLine(registered, agent), /handoff fold · prepare/, 'the budget stops the nagging')
+  assert.equal(agent.injected.length, 0, 'the reminder never travels as a user message')
   assert.ok(logs.some(([, message]) => String(message).includes('reminder budget spent')))
 })
