@@ -4,7 +4,7 @@
 
 > Give the model its **real** context occupancy — measured by the host and re-injected every turn — and stop the false claim "context is nearly exhausted" from surviving compaction.
 
-A DSH (DeepSeek Harness) plugin · one peer dependency (the host's own `schemastery`) · needs the host services `tokenMeter` and `compaction` (both shipped by `dsh-base`) · no tools · no build step · MIT
+A DSH (DeepSeek Harness) plugin · one peer dependency (the host's own `schemastery`) · needs the host services `tokenMeter` and `compaction` (both shipped by `dsh-base`) · 1 tool (`handoff_ready`, used by handoff folding) · 1 client settings card · no build step · MIT
 
 ---
 
@@ -69,7 +69,7 @@ The call is identified by the `purpose: 'compaction'` tag its caller sets. When 
 
 **Cost**: the directive grows from 1,802 to 2,336 characters — **+534 characters ≈ +134 tokens (+0.09%)**. It is appended *after* the cached prefix, so those 134 tokens are the only fresh full-price input a fold adds.
 
-### 3. Fold at the idle boundary (optional, **off by default**; when it fires it resolves a `compactNow` provider through a ranked candidate chain)
+### 3. Fold at the turn boundary: `idle` (default) / `handoff` (experimental)
 
 The host's automatic compaction is a *crossing* trigger, and the behaviour a model adopts near the point — batching round trips, avoiding risky edits, stopping mid-iteration to commit WIP — is exactly what keeps the reading below it. Measured on one live session:
 
@@ -79,9 +79,30 @@ instructions unable to finish the same task
 the reading parked at "Under 10K tokens of headroom remain"
 ```
 
-Every turn therefore starts with two to eight steps of room, and a task that needs continuous iteration — debugging a 500-line harness, say — never converges. This capability folds once at the model's **own turn boundary** (`agent/status === 'idle'`): when the reading comes within `foldAtIdleMarginPercent` (5% of the window by default — 50K on a 1M window) of the point, it calls the official `compaction.compactNow()`. The official engine only accepts that call while the agent is idle, which is exactly the moment this fires. The fold pushes the headroom back into the hundreds of thousands, so the condition stops holding: **one fold per cycle**.
+`foldMode` decides what this plugin does at the model's **own turn boundary** (`agent/status === 'idle'`):
 
-**Off by default**: it spends a summarizer call and rewrites the window, which is a policy decision rather than telemetry. The switch lives on the settings page (below).
+| Mode | Behaviour |
+|---|---|
+| `off` | Report only, never fold. Use it to leave folding entirely to the host's pressure trigger. |
+| `idle` | **Default.** When the reading comes within `foldAtIdleMarginPercent` (5% of the window by default — 50K on a 1M window) of the point, it calls the official `compaction.compactNow()`. The official engine only accepts that call while the agent is idle, which is exactly the moment this fires. The fold pushes the headroom back into the hundreds of thousands, so the condition stops holding: **one fold per cycle**. |
+| `handoff` | **Experimental.** The model writes a handoff note first, then the fold runs, then exactly one turn is activated to read that note back. See below. |
+
+> Compatibility: a config that never set `foldMode` resolves to `idle` (that is the behaviour this plugin always had, behind `foldAtIdle: true`); a config that explicitly set `foldAtIdle: false` still resolves to `off` and is not dragged along by the new default. An explicit `foldMode` always wins.
+
+#### Handoff folding (`handoff`, experimental)
+
+What actually costs a long task is not the summary but **the repeated work after the fold**: the model cannot know when it will be folded, then rebuilds its picture from the summary and redoes what it already did. Baseline (143 folds): **81 folds (57%) were followed by the model re-reading a file it had just written, 225 occurrences**.
+
+The chain is:
+
+1. At the **prep point** (`handoffAt` × the fold point, 85% by default) the plugin injects a reminder naming the **one** allowed note path (`$DSH_HOME/handoffs/<sessionId>/<fold#>.handoff.md`, never the workspace);
+2. the model writes everything the post-fold self needs (goal, settled decisions, evidence, next action, dead ends) and calls `handoff_ready`;
+3. at the end of that round the plugin calls `compactNow()`;
+4. after the fold it uses `followup` to activate **exactly one** turn whose first instruction is to read that note before touching the task.
+
+Guards: at most 3 reminders per cycle; if a round ends past the prep point with no note registered, the plugin **wakes** a round with `followup` to deliver the reminder (`agent.inject` only queues for the next request, so a reminder that lands on the model's last step would otherwise wait for a human — measured, and that is why the wake exists); notes are temporary, recycled when the next handoff is created with a 7-day sweep; a registered note whose fold did not happen is kept and never activates a turn.
+
+**Switching modes takes effect immediately, with no restart**: `foldMode` is volatile config, the settings card writes straight into the running reference, and the plugin resolves its options per use (verified live: after the panel switched to `handoff`, the running instance acted on it on its next call). Switching does **not** trigger a fold by itself — the fold still waits for the reading to reach the point.
 
 ## Data sources (all host-measured — nothing is estimated)
 
@@ -145,7 +166,11 @@ Capability 3 resolves its engine itself, at fold time, through a **ranked candid
 | `logBandChanges` | `true` | Log one `ctx.logger.info` per band change |
 | `patchCompactionPrompt` | `true` | Whether to extend the compaction directive |
 | `compactionRules` | see above | Rule array; `[]` disables capability 2 |
-| `foldAtIdle` | `false` | Enable capability 3 (fold at the idle boundary) |
+| `foldMode` | `idle` | Turn-boundary fold mode: `off` / `idle` (default) / `handoff` (experimental). The settings card writes this key and the change is live |
+| `handoffAt` | `0.85` | Prep point for the handoff reminder, as a fraction of the **fold point** (not the window) |
+| `handoffDir` | `''` | Note directory; empty means `$DSH_HOME/handoffs`, a relative path also resolves under `$DSH_HOME`, never the workspace |
+| `handoffReminders` | `3` | Reminders per cycle, wake included |
+| `foldAtIdle` | `false` | Legacy switch, equivalent to `foldMode: idle`; an explicit `false` means `off`. Only matters for a config that never set `foldMode` |
 | `foldAtIdleMarginPercent` | `5` | Fold once the headroom is within this percent of the window (50K on a 1M window) |
 | `foldAtIdleMethod` | `auto` | Channel for the request: `auto` runs the session's own `/compact` first (realm view), then falls back to the ranked service chain; `command` / `service` force one. `service` is the most predictable of the two (this profile uses it) |
 | `foldAtIdleCooldownMs` | `60000` | Minimum gap between attempts, so a failure cannot hammer the engine |
@@ -156,15 +181,13 @@ Capability 3 resolves its engine itself, at fold time, through a **ranked candid
 - id: context-truth            # the id the bundle patch declares
   name: dsh-context-truth
   config:
-    foldAtIdle: true
+    foldMode: idle             # off / idle (default) / handoff (experimental)
     foldAtIdleMarginPercent: 5
 ```
 
-A change takes effect **immediately**: the host's volatile mechanism writes the new value straight into the running config reference (`loader._commitVolatile`) instead of reloading the plugin, which is why the plugin resolves its options per use rather than snapshotting them at mount. Verified live: editing that row flipped `foldAtIdle` to `true` in the running config with no restart.
+A change takes effect **immediately**: the host's volatile mechanism writes the new value straight into the running config reference (`loader._commitVolatile`) instead of reloading the plugin, which is why the plugin resolves its options per use rather than snapshotting them at mount. Verified live: editing that row flipped the running config's `foldMode` with no restart (see "Switching modes takes effect immediately" above).
 
-> ⚠️ **This DSH build has no "render a form from the schema" mechanism for plugins.** Every plugin whose settings page exists (subagent, bash-terminal/shell, agent-loop, web-search) ships a **hand-written card in its own client package**, registered into the `plugins.item` slot; the generic `plugins.row.config` slot is registered by nobody. Exporting a Schemastery `Config` does make the host register the namespace (measured: `ns=context-truth`, `applies=live`) — but **no UI renders a generic form for a third-party plugin**, so the switches live in the patch.
->
-> A real settings-page toggle would need a **client card package** for this plugin, modelled on `@deepseek-ai/dsh-client-ui-settings-subagent`: register a `plugins.item` cell and bind a `z.boolean()` control to the settings form. The host will not generate one.
+> **The settings card is not generated — this plugin ships one.** This DSH build does not render a form from a plugin's `Config` schema; the host only wires the *registrations* into plugin pages (`plugins.bundle.config` / `plugins.row.config`). Since 0.3.0 this package carries `lib/client.js` (declared through `dsh.client` and `exports["./client"]`), which registers `plugins.bundle.config` with key `dsh-context-truth` and renders a fold-mode select wired to `settings.describe()` / `settings.mutate()`. It appears in the plugin page's detail view. Without that card the only way to switch is the profile patch above.
 
 `enabled` (the master switch) is best left to the on/off toggle on the plugin list — that one does reload the plugin.
 
@@ -184,19 +207,20 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 * If an agent preset sets `includeRuntimeContext: false` (for example `liangshen`), the runtime suppresses **every** runtime-context contribution and capability 1 does not apply (capability 2 is unaffected).
 * If a host froze the request envelope (**this version does not** — verified by capturing a real compaction request), capability 2 logs one warning and skips — it never breaks a model call. That warning is reserved for the engine's own tagged call, so a look-alike request can never silence a later real failure.
 * **Mounting twice in one scope does not fail**: bundle assembly plus a runtime injection are two assembly paths for the same plugin; the second instance detects the taken name, stays silent (one `info` line) and the first keeps serving — it never becomes a failed plugin row.
-* The plugin registers no tools and does not touch the tool catalog, so it adds nothing to the first-turn prefill.
+* The plugin registers **one tool**, `handoff_ready` (register a handoff note). It is in the catalog in every mode so the settings card can switch modes at any time, but it costs nothing unless called; only handoff mode calls it. It is still one tool definition in the first-turn prefill — the only change this plugin makes to the tool catalog. Folding itself never goes through a model tool call (the plugin calls `compaction.compactNow()` directly), so in `off` / `idle` modes the model sees no folding activity at all.
+* The plugin ships **one client module** (`lib/client.js`, the settings card). It only reads `settings.describe()` and writes `settings.mutate()`; it touches no workspace and makes no network requests.
 
 ## Verify
 
 ```sh
-npm test          # 51 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence
+npm test          # 69 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), client card shape
 ```
 
 After installing, open a new session and send one message: expanding that turn's runtime context block should show `Context occupancy (host-measured): …`, and the log carries `context-truth: none -> ample (used=… window=1000000 compactionAt=678464)`.
 
 ## Uninstall
 
-Remove the row from the profile patch / bundles list; a restart leaves nothing behind — no tools, no client, no state on disk.
+Remove the row from the profile patch / bundles list; a restart leaves nothing behind — with one exception: handoff mode writes notes and a state file under `$DSH_HOME/handoffs/<sessionId>/`, and deleting that directory clears them.
 
 ## License
 

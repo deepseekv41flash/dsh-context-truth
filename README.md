@@ -6,7 +6,7 @@
 
 > 让模型知道自己**真实的**上下文占用——每轮由宿主实测回填，并且不让"上下文快用完了"这句错话被压缩摘要继承下去。
 
-DSH（DeepSeek Harness）插件 · 单一 peer 依赖（宿主自带的 `schemastery`）· 需要宿主服务 `tokenMeter` 与 `compaction`（标准部署的 `dsh-base` 自带）· 零工具 · 免构建 · MIT
+DSH（DeepSeek Harness）插件 · 单一 peer 依赖（宿主自带的 `schemastery`）· 需要宿主服务 `tokenMeter` 与 `compaction`（标准部署的 `dsh-base` 自带）· 1 个工具（`handoff_ready`，交接式折叠用）· 1 个客户端设置卡片 · 免构建 · MIT
 
 ---
 
@@ -115,7 +115,7 @@ this in as few commands as possible, then a short answer."。数字它读对了�
 **代价**：指令从 1,802 涨到 2,336 字符，**+534 字符 ≈ +134 token（+0.09%）**；因为只加在
 缓存前缀**之后**，这 134 token 就是每次折叠唯一新增的全价输入。
 
-### 3. 空闲边界折叠（可选，**默认关**；触发时按候选链找带 `compactNow` 的实现）
+### 3. 轮末折叠：`idle`（默认）/ `handoff`（实验性）
 
 宿主的自动压缩是一个**"跨过阈值"**触发器，而模型在临近阈值时的行为——合并往返、回避高风险改动、
 改到一半就提交 WIP——**恰好使读数永远停在阈值下面**。实测一个长会话：
@@ -125,12 +125,40 @@ this in as few commands as possible, then a short answer."。数字它读对了�
 读数长期停在 "Under 10K tokens of headroom remain"
 ```
 
-于是每一轮都从"只剩 2~8 步"开始，需要连续迭代的任务（比如调试一个 500+ 行的 harness）永远收敛不了。
-本能力在**模型自己的回合边界**（`agent/status === 'idle'`）折叠一次：读数进入 `foldAtIdleMarginPercent`
-（默认窗口的 5%，1M 窗口即 50K）以内时调用官方 `compaction.compactNow()`。官方引擎本来就只允许在
-idle 时压缩，所以时机正好。折完余量回到几百 K，条件不再满足 → **一个周期只折一次**。
+`foldMode` 决定本插件在**模型自己的回合边界**（`agent/status === 'idle'`）做什么：
 
-**默认关**：它要花一次摘要调用并重写窗口，这是策略决定，不是遥测。开关就在设置页（见下）。
+| 模式 | 行为 |
+|---|---|
+| `off` | 只报告占用，从不折叠。想完全交给宿主的压力触发时用它。 |
+| `idle` | **默认。** 读数进入 `foldAtIdleMarginPercent`（默认窗口的 5%，1M 窗口即 50K）以内时调用官方 `compaction.compactNow()`。官方引擎本来就只允许在 idle 时压缩，所以时机正好。折完余量回到几百 K，条件不再满足 → **一个周期只折一次**。 |
+| `handoff` | **实验性。** 先让模型写交接档，再折叠，折叠后自动开唯一一轮把档读回来。见下。 |
+
+> 兼容性：没写过 `foldMode` 的旧配置按 `idle` 处理（它就是本插件此前的行为，当时由 `foldAtIdle: true` 打开）；
+> 显式写过 `foldAtIdle: false` 的配置仍然解析成 `off`，不会被这次改默认值带走。显式 `foldMode` 永远优先。
+
+#### 交接式折叠（`handoff`，实验性）
+
+长任务真正贵的不是摘要本身，而是**折叠后的重复劳动**：模型不知道什么时候会被折，折叠后又
+基于摘要重建画面，于是把上一轮已经做过的事再做一遍。基线测量（143 次折叠）：**81 次（57%）
+折叠后重新读取了自己刚写过的文件，合计 225 次**。
+
+这条链路是：
+
+1. 读数到达**准备点**（`handoffAt` × 折叠点，默认 85%）时，插件往本会话注入一条提醒，给出**唯一**
+   允许的交接档路径（`$DSH_HOME/handoffs/<sessionId>/<fold#>.handoff.md`，绝不写进工作区）；
+2. 模型把"折叠后的自己需要知道的一切"写进这份档（目标、已定案、证据、下一步、走过的死路），
+   然后调用 `handoff_ready` 登记；
+3. 这一轮结束时插件调用 `compactNow()` 真正折叠；
+4. 折叠后插件用 `followup` **只自动激活一轮**，第一条指令就是"先读这份档，再从它的下一步继续"。
+
+护栏：提醒每周期最多 3 次；某个回合结束时如果模型还没登记、但已过准备点，插件会用
+`followup` **唤醒**一轮把提醒送到（`agent.inject` 只排进下一次请求，轮次结束时没人再发请求，
+提醒就会一直等人类开口——实测踩过）；交接档是临时文件，下一次交接生成时回收旧的、7 天兜底清理；
+登记了档但没折成（引擎拒绝、被别的东西先折了）时不会激活，档保留。
+
+**切换模式立即生效，不需要重启**：`foldMode` 是 volatile 配置，设置卡直接写进运行中的引用，
+插件每次调用都重新解析选项（实测：面板切到 `handoff` 后，运行中的实例在下一次调用就按 handoff 执行）。
+但切换本身**不会触发折叠**——折叠仍要等读数到点。
 
 ## 数据来源（都是宿主的真实数字，没有估算）
 
@@ -198,7 +226,11 @@ dsh plugin --profile web add dsh-context-truth
 | `logBandChanges` | `true` | 分档变化时写一条 `ctx.logger.info` |
 | `patchCompactionPrompt` | `true` | 是否给压缩指令补规则 |
 | `compactionRules` | 见上 | 规则数组；`[]` 关闭本能力 |
-| `foldAtIdle` | `false` | 是否启用第 3 个能力（空闲边界折叠） |
+| `foldMode` | `idle` | 轮末折叠模式：`off` / `idle`（默认）/ `handoff`（实验性）。设置卡直接写这个键，切换立即生效 |
+| `handoffAt` | `0.85` | 交接提醒的准备点，作为**折叠点**的比例（不是窗口比例） |
+| `handoffDir` | `''` | 交接档目录；空＝`$DSH_HOME/handoffs`，相对路径也落在 `$DSH_HOME` 下，绝不进工作区 |
+| `handoffReminders` | `3` | 每个周期最多提醒几次（含轮末唤醒） |
+| `foldAtIdle` | `false` | 旧开关，等价于 `foldMode: idle`；显式 `false` 等价于 `off`，只对没写过 `foldMode` 的配置生效 |
 | `foldAtIdleMarginPercent` | `5` | 余量 ≤ 窗口的百分之几时触发（1M 窗口 = 50K） |
 | `foldAtIdleMethod` | `auto` | 折叠请求通道：`auto`＝先走该会话的 `/compact`（realm 视图）再回退到服务候选链；`command`／`service` 强制其一。`service` 是最可预测的一档（本 profile 用它） |
 | `foldAtIdleCooldownMs` | `60000` | 两次尝试之间的最小间隔（失败也不会反复撞引擎） |
@@ -209,23 +241,21 @@ dsh plugin --profile web add dsh-context-truth
 - id: context-truth            # 与 bundle patch 里的行 id 相同
   name: dsh-context-truth
   config:
-    foldAtIdle: true
+    foldMode: idle             # off / idle（默认）/ handoff（实验性）
     foldAtIdleMarginPercent: 5
 ```
 
 改动**立即生效**：宿主的 volatile 机制把新值直接写进运行中的配置引用（`loader._commitVolatile`），
 不重载插件；插件因此每次使用时才解析选项，而不是挂载时快照。实测：改完 patch 无需重启，运行中的
-`foldAtIdle` 立刻变成 `true`。
+`foldMode` 立刻变成新模式（见上文"切换模式立即生效"）。
 
-> ⚠️ **这个 DSH 版本没有"按 schema 自动生成插件设置表单"的机制。** 官方插件（`subagent`、
-> `bash-terminal`/shell、`agent-loop`、`web-search`）的设置界面都是**各自客户端包手写的卡片**
-> （按条目 id 注册进 `plugins.item` 插槽），通用的 `plugins.row.config` 插槽**全应用无人注册**。
-> 插件导出 Schemastery `Config` 会让宿主注册这个命名空间（实测 `ns=context-truth`、`applies=live`），
-> 但**没有任何 UI 会渲染第三方插件的通用表单**——所以开关落在 profile patch 里。
->
-> 想要一个真正的设置页面开关，就得给插件写一个**客户端卡片包**（照
-> `@deepseek-ai/dsh-client-ui-settings-subagent` 的样子：注册 `plugins.item` 插槽 + 一个绑定
-> settings 表单的 `z.boolean()` 控件）。宿主不会自动生成它。
+> **设置卡不是自动生成的，但这个插件自己带了一张。** 这个 DSH 版本不会按 `Config` schema 自动生成
+> 插件设置表单：官方插件都是各自客户端包手写的卡片，宿主只负责把 `plugins.bundle.config` /
+> `plugins.row.config` 这些插槽的**注册**接进插件页。本包自 0.3.0 起带 `lib/client.js`
+> （`package.json` 里声明 `dsh.client` + `exports["./client"]`），注册的是
+> `plugins.bundle.config`（key = 包名 `dsh-context-truth`），渲染一个"折叠模式"下拉框，
+> 读写走 `settings.describe()` / `settings.mutate()`。它出现在插件页 dsh-context-truth 的详情里。
+> 没有这张卡时，只能改 profile patch（上面那种写法）。
 
 `enabled`（总开关）用**插件列表里的开关**即可——那一个会重载插件。
 
@@ -253,12 +283,17 @@ runtime-context 快照**字节不变就不会重发**，所以读数按台阶量
 * **同一作用域挂载两次不会失败**：bundle 装配 + 运行时注入是同一插件的两条装配路径，
   第二个实例检测到重名后保持静默（只记一条 info），由第一个实例继续服务——不会变成
   一行 failed 的插件记录。
-* 本插件不注册任何工具、不改工具目录，因此不增加首轮 prefill。
+* 本插件注册 **1 个工具**：`handoff_ready`（交接档登记）。它在所有模式下都会出现在工具目录里
+  （设置卡需要能随时切换模式），不产生额外调用；只有 handoff 模式会用它。工具定义很小，但仍算
+  **一次首轮 prefill** 的成本——这是本插件唯一改工具目录的地方。折叠本身不经过模型工具调用
+  （插件直接调 `compaction.compactNow()`），所以 `off`/`idle` 模式下模型侧看不到任何折叠活动。
+* 本插件带 **1 个客户端模块**（`lib/client.js`，插件页的设置卡）。它只读 `settings.describe()`、
+  写 `settings.mutate()`，不碰工作区、不发网络请求。
 
 ## 验证
 
 ```sh
-npm test          # 51 项单测：分档/迟滞/量化/自由窗口/折叠定义/空闲折叠与护栏/配置热更新/schema 默认值一致性/节奏估算/降级/摘要改写/形似请求排除/幂等
+npm test          # 69 项单测：分档/迟滞/量化/自由窗口/折叠定义/空闲折叠与护栏/配置热更新/schema 默认值一致性/节奏估算/降级/摘要改写/形似请求排除/幂等/交接式折叠（提醒、登记、轮末折叠、单次激活、重启恢复、回收、轮末唤醒）/客户端设置卡结构
 ```
 
 装好后开一个新会话发一条消息，展开该轮的 runtime context 块应看到
@@ -267,7 +302,8 @@ npm test          # 51 项单测：分档/迟滞/量化/自由窗口/折叠定�
 
 ## 卸载
 
-从 profile patch / bundles 里删掉那一行即可，重启即净——没有工具、没有客户端、没有落盘状态。
+从 profile patch / bundles 里删掉那一行即可，重启即净——没有落盘状态（例外：handoff 模式在
+`$DSH_HOME/handoffs/<sessionId>/` 下写交接档和一份状态文件，删掉那个目录即净）。
 
 ## License
 

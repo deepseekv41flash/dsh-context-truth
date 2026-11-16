@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import { apply, internals, name, inject, Config, CONTEXT_NAME, VARIABLE_NAME } from '../lib/index.js'
 
 const { resolveOptions, readOccupancy, settleBand, quantize, quantizeHeadroom, headroomDisplayStep, render, patchCompactionInstruction, patchCompactionRequest, isCompactionRequest, isTaggedCompactionRequest, messageText, DEFAULT_OPTIONS, DEFAULT_COMPACTION_RULES, PACE_LADDER, median, nextPaceState, samplePace, paceSteps, paceRung, settlePace, paceSentence, tightClause, foldClause, shouldFoldAtIdle, backendIdentity } = internals
+
+const { resolveFoldMode, handoffTrigger, handoffRoot, handoffPathFor, handoffPrepMessage, handoffActivationMessage, handoffReapable, sweepHandoffs, handoffFileChars, safeSegment, sessionIdOf, isDelegate, samePath, HANDOFF_TOOL_NAME, HANDOFF_MIN_CHARS, HANDOFF_MAX_AGE_MS, HANDOFF_STATE_FILE } = internals
 
 /** A 1M window reserving the DeepSeek adapter's default 256K completion tokens. */
 const WINDOW = 1000000
@@ -12,10 +17,21 @@ const MAX_TOKENS = 256000
 const THRESHOLD = 678464
 
 /** Minimal ctx capturing what the plugin registers. */
-function stubContext({ used, meter, projections, compaction, commands, logs } = {}) {
-  const registered = { variable: undefined, context: undefined, listeners: {}, injections: [] }
+function stubContext({ used, meter, projections, compaction, commands, logs, tools } = {}) {
+  const registered = { variable: undefined, context: undefined, listeners: {}, injections: [], tools: [], effects: [], timers: [] }
   const tokenMeter = meter === undefined ? { measure: () => ({ totalTokens: used }) } : meter
-  const services = { tokenMeter, compaction, sessionProjections: projections, commands }
+  // A host always mounts the tools service, so the stub does too: without it the
+  // handoff tool cannot register and every log assertion would see that warning.
+  const toolsService =
+    tools === undefined
+      ? {
+          register: (definition) => {
+            registered.tools.push(definition)
+            return () => {}
+          },
+        }
+      : tools
+  const services = { tokenMeter, compaction, sessionProjections: projections, commands, tools: toolsService }
   const ctx = {
     logger:
       logs === undefined
@@ -50,8 +66,27 @@ function stubContext({ used, meter, projections, compaction, commands, logs } = 
         registered.context = contribution
       },
     },
+    // Two capabilities now share `agent/status` (the idle fold and the handoff
+    // fold), and a host runs every listener. Composing here keeps every existing
+    // assertion working — `listeners[event](payload)` still fires all of them.
     on: (event, listener) => {
-      registered.listeners[event] = listener
+      const previous = registered.listeners[event]
+      registered.listeners[event] =
+        previous === undefined
+          ? listener
+          : (...args) => {
+              previous(...args)
+              listener(...args)
+            }
+    },
+    effect: (callback, label) => {
+      registered.effects.push(label)
+      const dispose = callback()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
+    setInterval: (callback, ms) => {
+      registered.timers.push({ callback, ms })
+      return () => {}
     },
   }
   return { ctx, registered }
@@ -927,21 +962,30 @@ test('the idle fold fires at the turn boundary once the room runs out', async ()
   await tick()
   assert.equal(calls.length, 1, 'a calm session must not fold')
 
-  // Off by default: the listener exists (so the switch is live) but never folds.
+  // Default mode is `idle`: a config nobody touched folds at the turn boundary,
+  // which is the behaviour this plugin always had behind `foldAtIdle: true`.
+  const byDefault = stubContext({ used: 640000, compaction })
+  apply(byDefault.ctx, {})
+  assert.equal(typeof byDefault.registered.listeners['agent/status'], 'function')
+  byDefault.registered.listeners['agent/status']({ agent: { session }, status: 'idle' })
+  await tick()
+  assert.equal(calls.length, 2, 'the default mode folds at the turn boundary')
+
+  // Explicitly off: the listener exists (so the switch is live) but never folds.
   const off = stubContext({ used: 640000, compaction })
-  apply(off.ctx, {})
+  apply(off.ctx, { foldMode: 'off' })
   assert.equal(typeof off.registered.listeners['agent/status'], 'function')
   off.registered.listeners['agent/status']({ agent: { session }, status: 'idle' })
   await tick()
-  assert.equal(calls.length, 1, 'the default configuration must not fold anything')
+  assert.equal(calls.length, 2, 'an explicit off must not fold anything')
 
   // The pure decision, including the band where the fold must not fire.
   const options = resolveOptions({ foldAtIdle: true })
   assert.equal(shouldFoldAtIdle({ used: 640000, threshold: THRESHOLD, window: WINDOW }, options).fold, true)
   assert.equal(shouldFoldAtIdle({ used: 620000, threshold: THRESHOLD, window: WINDOW }, options).fold, false)
   assert.equal(shouldFoldAtIdle({ used: 640000, threshold: undefined, window: WINDOW }, options).fold, false)
-  assert.equal(shouldFoldAtIdle({ used: 640000, threshold: THRESHOLD, window: WINDOW }, resolveOptions({})).fold, false)
-  assert.equal(DEFAULT_OPTIONS.foldAtIdle, false, 'the fold is a policy decision, so it ships off')
+  assert.equal(shouldFoldAtIdle({ used: 640000, threshold: THRESHOLD, window: WINDOW }, resolveOptions({ foldMode: 'off' })).fold, false)
+  assert.equal(DEFAULT_OPTIONS.foldMode, 'idle', 'the automatic idle fold is the default')
 })
 
 test('an idle fold never breaks a turn', async () => {
@@ -1152,4 +1196,593 @@ test('a diagnostic string from the property read never shadows a working service
   stub.registered.listeners['agent/status']({ agent: { session: stubSession() }, status: 'idle' })
   await tick()
   assert.equal(calls.length, 1, 'the reachable service must win over the diagnostic string')
+})
+
+// ---------------------------------------------------------------------------
+// Capability 3: foldMode 'handoff'
+//
+// The state machine has more ways to stop than to proceed, so every stop is
+// asserted with the same weight as the happy path: a fold that silently does not
+// happen is the failure this mode exists to remove, and one that happens when it
+// should not is worse.
+// ---------------------------------------------------------------------------
+
+/** A root-session fixture carrying the header the handoff state keys on. */
+function handoffSession(id = 'session-handoff-1', { depth = 0 } = {}) {
+  return {
+    id,
+    header: { id, delegationDepth: depth },
+    requestContext: () => ({ contextWindow: WINDOW }),
+    requestHeader: () => ({ config: { maxTokens: MAX_TOKENS } }),
+  }
+}
+
+/** A live-agent fixture recording what the plugin injects and activates. */
+function handoffAgent(session) {
+  const agent = {
+    status: 'running',
+    session,
+    injected: [],
+    followed: [],
+    inject: (message) => agent.injected.push(message),
+    followup: (message) => agent.followed.push(message),
+  }
+  return agent
+}
+
+/** A token meter a test can move between steps. */
+function movableMeter(used) {
+  const box = { used }
+  return { box, meter: { measure: () => ({ totalTokens: box.used }) } }
+}
+
+/** Fire the composed `agent/request` waterfall at one step. */
+function requestStep(registered, agent, turn, step = 1) {
+  const listener = registered.listeners['agent/request']
+  assert.equal(typeof listener, 'function', 'handoff mode must subscribe to agent/request')
+  return listener({ agent, turn, step, signal: {} }, () => Promise.resolve({}))
+}
+
+/** Fire the composed `agent/status` listeners at an idle boundary and settle them. */
+async function idleBoundary(registered, agent) {
+  registered.listeners['agent/status']({ agent, status: 'idle' })
+  await tick()
+  await tick()
+}
+
+/** A scratch handoff root that the test removes afterwards. */
+function scratchRoot(t) {
+  const root = mkdtempSync(join(tmpdir(), 'ct-handoff-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  return root
+}
+
+test('foldMode: absent means idle, an explicit opt-out or mode wins', () => {
+  assert.equal(DEFAULT_OPTIONS.foldMode, 'idle', 'the automatic idle fold is the default')
+  assert.equal(resolveOptions({}).foldMode, 'idle')
+  assert.equal(resolveOptions({ foldAtIdle: true }).foldMode, 'idle', 'the legacy switch means the same thing as the default')
+  assert.equal(resolveOptions({ foldAtIdle: false }).foldMode, 'off', 'an explicit opt-out is honoured')
+  assert.equal(resolveOptions({ foldAtIdle: true, foldMode: 'off' }).foldMode, 'off', 'an explicit mode beats the alias')
+  assert.equal(resolveOptions({ foldAtIdle: false, foldMode: 'handoff' }).foldMode, 'handoff')
+  assert.equal(resolveOptions({ foldMode: 'nonsense' }).foldMode, 'idle', 'an unknown value degrades to the default')
+
+  // The schema is the first line of defence, and the mode is decided by the
+  // RESOLVED value, not by key presence: `.volatile()` materializes the key as a
+  // reference cell even when the user never set it, so presence proves nothing.
+  // What must hold is that a config the user never touched resolves to `idle`,
+  // an explicit `foldAtIdle: false` still opts out, through the real schema.
+  assert.throws(() => Config({ foldMode: 'nonsense' }))
+  assert.equal(resolveOptions(Config({})).foldMode, 'idle')
+  assert.equal(resolveOptions(Config({ foldAtIdle: false })).foldMode, 'off')
+  assert.equal(resolveOptions(Config({ foldAtIdle: true })).foldMode, 'idle')
+  assert.equal(resolveOptions(Config({ foldMode: 'off' })).foldMode, 'off')
+  assert.equal(resolveOptions(Config({ foldMode: 'handoff' })).foldMode, 'handoff')
+
+  // One gate decides both spellings, so handoff mode can never also idle-fold.
+  assert.equal(shouldFoldAtIdle({ used: 640000, threshold: THRESHOLD, window: WINDOW }, resolveOptions({ foldMode: 'handoff' })).fold, false)
+  assert.equal(shouldFoldAtIdle({ used: 640000, threshold: THRESHOLD, window: WINDOW }, resolveOptions({ foldMode: 'idle' })).fold, true)
+})
+
+test('handoff notes live under $DSH_HOME, one directory per session, never the workspace', () => {
+  const env = { DSH_HOME: join(tmpdir(), 'ct-home') }
+  const base = resolveOptions({ foldMode: 'handoff' })
+  assert.equal(handoffRoot(base, env), join(env.DSH_HOME, 'handoffs'))
+  assert.equal(handoffRoot(resolveOptions({ foldMode: 'handoff', handoffDir: 'notes-test' }), env), join(env.DSH_HOME, 'notes-test'))
+  const absolute = join(tmpdir(), 'ct-absolute')
+  assert.equal(handoffRoot(resolveOptions({ foldMode: 'handoff', handoffDir: absolute }), env), absolute)
+  // No DSH_HOME in the environment → ~/.dsh, which is still not the workspace.
+  assert.equal(handoffRoot(base, {}), join(homedir(), '.dsh', 'handoffs'))
+
+  const root = join(tmpdir(), 'ct-h')
+  assert.equal(handoffPathFor(root, 'session-abc', 1), join(root, 'session-abc', '001.handoff.md'))
+  assert.ok(handoffPathFor(root, 'session-abc', 42).endsWith('042.handoff.md'))
+
+  // A session id cannot climb out of its own directory, and an empty one is named.
+  const segment = safeSegment('../../etc/passwd')
+  assert.equal(/[\\/]/.test(segment), false)
+  assert.equal(segment.startsWith('.'), false)
+  assert.equal(safeSegment(''), 'unknown-session')
+
+  // The identity comes from the header first, which is the id the store uses.
+  assert.equal(sessionIdOf({ id: 'from-body', header: { id: 'from-header' } }), 'from-header')
+  assert.equal(sessionIdOf({ id: 'from-body' }), 'from-body')
+  assert.equal(sessionIdOf({}), '')
+})
+
+test('the prep point is a fraction of the fold point, and only handoff mode prepares', () => {
+  const options = resolveOptions({ foldMode: 'handoff' })
+  const point = Math.round(THRESHOLD * 0.85)
+  assert.equal(handoffTrigger({ used: 580000, threshold: THRESHOLD, window: WINDOW }, options).point, point)
+  assert.equal(handoffTrigger({ used: point, threshold: THRESHOLD, window: WINDOW }, options).prepare, true)
+  assert.equal(handoffTrigger({ used: point - 1, threshold: THRESHOLD, window: WINDOW }, options).prepare, false)
+  assert.equal(handoffTrigger({ used: 1e6 }, options).prepare, false, 'no fold point, no prep')
+  assert.equal(handoffTrigger({ used: 1e6, threshold: THRESHOLD }, resolveOptions({})).prepare, false)
+  assert.equal(handoffTrigger({ used: 1e6, threshold: THRESHOLD }, resolveOptions({ foldAtIdle: true })).prepare, false, 'idle mode must not prepare')
+
+  // The configured fraction is honoured and clamped to the documented range.
+  const at = (value) => handoffTrigger({ used: 1, threshold: THRESHOLD }, resolveOptions({ foldMode: 'handoff', handoffAt: value })).point
+  assert.equal(at(0.85), point)
+  assert.equal(at(0.1), Math.round(THRESHOLD * 0.5))
+  assert.equal(at(0.99), Math.round(THRESHOLD * 0.95))
+
+  // Both messages name the note and the temporary-file warning; the prepare line
+  // also says where in the fold the session is standing.
+  const path = handoffPathFor(join(tmpdir(), 'h'), 'session-abc', 3)
+  const trigger = handoffTrigger({ used: 600000, threshold: THRESHOLD, window: WINDOW }, options)
+  const zhOptions = resolveOptions({ foldMode: 'handoff', language: 'zh' })
+  const zhPrep = handoffPrepMessage({ path, trigger, recycled: 2, options: zhOptions })
+  assert.ok(zhPrep.includes(path))
+  assert.match(zhPrep, new RegExp(`${Math.round((600000 / THRESHOLD) * 100)}%`))
+  assert.match(zhPrep, /临时文件/)
+  assert.match(zhPrep, /handoff_ready/)
+  assert.match(zhPrep, /2/)
+  const enOptions = resolveOptions({ foldMode: 'handoff' })
+  const enPrep = handoffPrepMessage({ path, trigger, recycled: 0, options: enOptions })
+  assert.ok(enPrep.includes(path))
+  assert.match(enPrep, /temporary file/)
+  const enActivation = handoffActivationMessage({ path, foldNo: 1, options: enOptions })
+  assert.ok(enActivation.includes(path))
+  assert.match(enActivation, /only auto-activated turn/)
+})
+
+test('handoff mode folds at the round end and activates exactly one turn', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(500000)
+  const folds = []
+  const logs = []
+  const session = handoffSession('session-happy')
+  const agent = handoffAgent(session)
+  const { ctx, registered } = stubContext({
+    meter,
+    logs,
+    compaction: {
+      compactNow: (...args) => {
+        folds.push(args)
+        return Promise.resolve({ shadowedSeqs: [1], shadowedTokenCount: 10, summarySeq: 2 })
+      },
+    },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, language: 'zh' })
+
+  // Below the prep point: no reminder, no tool call, nothing.
+  await requestStep(registered, agent, 1)
+  assert.equal(agent.injected.length, 0)
+
+  // Crossing it injects one reminder naming the exact path.
+  box.used = 600000
+  await requestStep(registered, agent, 2, 1)
+  assert.equal(agent.injected.length, 1, 'the prep reminder must be injected')
+  const notePath = handoffPathFor(root, 'session-happy', 1)
+  const prepText = agent.injected[0].content[0].text
+  assert.ok(prepText.includes(notePath), 'the reminder must name the exact path')
+  assert.equal(agent.injected[0].role, 'user')
+  assert.equal(agent.injected[0].source.kind, 'user')
+
+  // One per turn, even though the waterfall runs on every step.
+  await requestStep(registered, agent, 2, 2)
+  await requestStep(registered, agent, 2, 3)
+  assert.equal(agent.injected.length, 1)
+
+  // The tool refuses a note that does not exist yet.
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.ok(tool !== undefined, 'handoff mode must register handoff_ready')
+  assert.equal(tool.output.render([], 'x')[0].text, 'x')
+  assert.match(tool.execute({}, { agent }), /还没有文件/)
+
+  // Write the note, register it.
+  mkdirSync(join(root, 'session-happy'), { recursive: true })
+  writeFileSync(notePath, `# 交接档\n${'x'.repeat(400)}`, 'utf8')
+  const registeredText = tool.execute({ path: notePath }, { agent })
+  assert.match(registeredText, /✓ 交接档已登记/)
+  assert.ok(registeredText.includes(notePath))
+
+  // The round ends: fold once, activate once.
+  await idleBoundary(registered, agent)
+  assert.equal(folds.length, 1, 'the round end must fold')
+  assert.ok(folds[0][1] !== undefined, 'compactNow must receive an abort signal')
+  assert.equal(agent.followed.length, 1, 'exactly one activation turn')
+  const activation = agent.followed[0].content[0].text
+  assert.ok(activation.includes(notePath))
+  assert.match(activation, /唯一一次自动激活/)
+  assert.equal(agent.followed[0].source.kind, 'user')
+
+  // A second idle boundary activates nothing more, and the fold is not repeated.
+  // A real fold drops the reading below the prep point, which is what keeps the
+  // reminder (and its wake) out of the activation round.
+  box.used = 100000
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 1)
+  assert.equal(folds.length, 1)
+
+  // The state is durable, and it says exactly what happened.
+  const state = JSON.parse(readFileSync(join(root, 'session-happy', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 1)
+  assert.equal(state.ready, null)
+  assert.equal(state.pending.foldNo, 1)
+  assert.ok(state.pending.deliveredAt > 0)
+})
+
+test('a round that ends past the prep point wakes one reminder turn, bounded by the budget', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const folds = []
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-nonote'))
+  const { ctx, registered } = stubContext({
+    meter,
+    logs,
+    compaction: { compactNow: (...args) => (folds.push(args), Promise.resolve({ shadowedSeqs: [1] })) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  // The mid-round reminder is queued for the next request; the model ends the
+  // round without writing a note.
+  await requestStep(registered, agent, 1)
+  assert.equal(agent.injected.length, 1)
+  await idleBoundary(registered, agent)
+  assert.equal(folds.length, 0, 'handoff mode must not fold behind the model\'s back')
+  assert.equal(agent.followed.length, 1, 'an unread reminder must wake the round instead of waiting for a human')
+  assert.ok(agent.followed[0].content[0].text.includes(handoffPathFor(root, 'session-nonote', 1)))
+  assert.ok(
+    logs.some(([, message]) => String(message).includes('woke the round')),
+    'the wake must be logged',
+  )
+
+  // A second idle event of the same round must not add a second wake.
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 1)
+
+  // The wake round starts: the wake message is this round's reminder, so the
+  // waterfall must not stack a second copy in it.
+  await requestStep(registered, agent, 2)
+  assert.equal(agent.injected.length, 1, 'no duplicate reminder in the wake round')
+  await requestStep(registered, agent, 2, 2)
+  assert.equal(agent.injected.length, 1, 'and none on a later step of the same wake round')
+
+  // Still no note: the budget allows one more wake, then it stops.
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 2)
+  await requestStep(registered, agent, 3)
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 2, 'the reminder budget must cap the wakes')
+  assert.equal(folds.length, 0)
+  assert.ok(logs.some(([, message]) => String(message).includes('budget spent')))
+})
+
+test('a failed fold keeps the note and activates nothing', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-fail'))
+  const { ctx, registered } = stubContext({
+    meter,
+    logs,
+    compaction: { compactNow: () => Promise.reject(new Error('engine busy')) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+  const notePath = handoffPathFor(root, 'session-fail', 1)
+  mkdirSync(join(root, 'session-fail'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.match(tool.execute({}, { agent }), /✓/)
+
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 0, 'a fold that threw must not activate a turn')
+  assert.ok(logs.some(([, message]) => String(message).includes('handoff fold failed')))
+  const state = JSON.parse(readFileSync(join(root, 'session-fail', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 0, 'a failed fold does not count')
+  assert.equal(state.ready.path, notePath, 'the note stays for the next attempt')
+  assert.equal(state.pending, null)
+})
+
+test('an activation that cannot be sent survives a restart and is delivered once', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-restart'))
+  let refuses = true
+  agent.followup = (message) => {
+    if (refuses) throw new Error('agent gone')
+    agent.followed.push(message)
+  }
+  const compaction = { compactNow: () => Promise.resolve({ shadowedSeqs: [1] }) }
+  const first = stubContext({ meter, logs, compaction })
+  apply(first.ctx, { foldMode: 'handoff', handoffDir: root })
+  const notePath = handoffPathFor(root, 'session-restart', 1)
+  mkdirSync(join(root, 'session-restart'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  first.registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME).execute({}, { agent })
+
+  await idleBoundary(first.registered, agent)
+  assert.equal(agent.followed.length, 0)
+  assert.ok(logs.some(([, message]) => String(message).includes('could not activate the post-fold turn')))
+  const afterFold = JSON.parse(readFileSync(join(root, 'session-restart', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(afterFold.foldNo, 1, 'the fold itself succeeded')
+  assert.equal(afterFold.pending.deliveredAt, null)
+  assert.equal(afterFold.pending.attempts, 1, 'the attempt is durable before it is sent')
+
+  // A fresh apply() is what a restart looks like: nothing in memory survives.
+  refuses = false
+  const second = stubContext({ meter, compaction })
+  apply(second.ctx, { foldMode: 'handoff', handoffDir: root })
+  await idleBoundary(second.registered, agent)
+  assert.equal(agent.followed.length, 1, 'the pending activation must be delivered after a restart')
+  // The fold dropped the reading: no reminder wake may follow the activation.
+  box.used = 100000
+  await idleBoundary(second.registered, agent)
+  assert.equal(agent.followed.length, 1, 'and only once')
+})
+
+test('the activation cap gives up instead of looping', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-cap'))
+  const dir = join(root, 'session-cap')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(
+    join(dir, HANDOFF_STATE_FILE),
+    JSON.stringify({
+      version: 1,
+      sessionId: 'session-cap',
+      foldNo: 1,
+      pending: { path: join(dir, '001.handoff.md'), foldNo: 1, attempts: 2, deliveredAt: null },
+    }),
+    'utf8',
+  )
+  const { ctx, registered } = stubContext({ meter, logs, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 0, 'the cap must stop the retry loop')
+  // `logLine` hands the host a printf-style template, so the count lives in the
+  // arguments, not in the message text.
+  assert.ok(
+    logs.some(([, message, , , attempts]) => String(message).includes('leaving the session to the human') && attempts === 2),
+    'the give-up must be logged with the attempt count',
+  )
+})
+
+test('a delegated session is never prepared, registered, or folded', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const folds = []
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-child', { depth: 2 }))
+  const { ctx, registered } = stubContext({
+    meter,
+    logs,
+    compaction: { compactNow: (...args) => (folds.push(args), Promise.resolve({})) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  await requestStep(registered, agent, 1)
+  assert.equal(agent.injected.length, 0, 'a delegate must not be reminded')
+  const notePath = handoffPathFor(root, 'session-child', 1)
+  mkdirSync(join(root, 'session-child'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.match(tool.execute({}, { agent }), /delegated session/)
+  await idleBoundary(registered, agent)
+  assert.equal(folds.length, 0)
+  assert.equal(isDelegate(handoffSession('root', { depth: 0 })), false)
+})
+
+test('the activation target survives the prep that hands out the next note', async (t) => {
+  const root = scratchRoot(t)
+  const dir = join(root, 'session-gc')
+  mkdirSync(dir, { recursive: true })
+  // 现场复刻（2026-11-16 实机演练）：fold #1 的激活档 001.handoff.md 与更早的草稿同在一个
+  // 目录里，准备轮为 fold #2 发提醒。旧实现把 001 一起回收 —— 实测激活 18:39:58.877，
+  // 回收 18:40:03.431，激活轮第一条 read 18:40:04.983 得到 FS_NOT_FOUND。这里钉住：
+  // 激活目标必须留下，只有更早的草稿被回收。
+  writeFileSync(join(dir, '001.handoff.md'), 'activation target', 'utf8')
+  writeFileSync(join(dir, '001.drill.md'), 'older draft', 'utf8')
+  writeFileSync(
+    join(dir, HANDOFF_STATE_FILE),
+    JSON.stringify({
+      version: 1,
+      sessionId: 'session-gc',
+      foldNo: 1,
+      pending: { path: join(dir, '001.handoff.md'), foldNo: 1, attempts: 1, deliveredAt: 1 },
+    }),
+    'utf8',
+  )
+  const { box, meter } = movableMeter(600000)
+  const agent = handoffAgent(handoffSession('session-gc'))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  await requestStep(registered, agent, 1)
+  assert.equal(agent.injected.length, 1)
+  assert.ok(agent.injected[0].content[0].text.includes(handoffPathFor(root, 'session-gc', 2)))
+  assert.equal(existsSync(join(dir, '001.handoff.md')), true, 'the note the delivered activation points at is still there')
+  assert.equal(existsSync(join(dir, '001.drill.md')), false, 'the older draft is recycled')
+  assert.equal(
+    handoffReapable(root, 'session-gc', [handoffPathFor(root, 'session-gc', 2), handoffPathFor(root, 'session-gc', 1)]).length,
+    0,
+    'recycling is idempotent',
+  )
+})
+
+test('the note of the last fold is kept even when no activation record is left', async (t) => {
+  const root = scratchRoot(t)
+  const dir = join(root, 'session-gc')
+  mkdirSync(dir, { recursive: true })
+  // 不变量与持久化记录解耦：只要目录里还有 fold N 的档，准备轮 N+1 就不能删它 ——
+  // 哪怕 pending 已经不在了（旧版状态文件、或将来清空 pending 的版本）。
+  writeFileSync(join(dir, '001.handoff.md'), 'last fold', 'utf8')
+  writeFileSync(join(dir, HANDOFF_STATE_FILE), JSON.stringify({ version: 1, sessionId: 'session-gc', foldNo: 1 }), 'utf8')
+  const { box, meter } = movableMeter(600000)
+  const agent = handoffAgent(handoffSession('session-gc'))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  await requestStep(registered, agent, 1)
+  assert.equal(existsSync(join(dir, '001.handoff.md')), true, 'the newest note is not recyclable while it is still the activation target')
+})
+
+test('the note of an older fold is recycled once a newer fold exists', async (t) => {
+  const root = scratchRoot(t)
+  const dir = join(root, 'session-gc')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, '001.handoff.md'), 'fold 1', 'utf8')
+  writeFileSync(join(dir, '002.handoff.md'), 'fold 2', 'utf8')
+  writeFileSync(
+    join(dir, HANDOFF_STATE_FILE),
+    JSON.stringify({ version: 1, sessionId: 'session-gc', foldNo: 2, pending: { path: join(dir, '002.handoff.md'), foldNo: 2, attempts: 1, deliveredAt: 1 } }),
+    'utf8',
+  )
+  const { box, meter } = movableMeter(600000)
+  const agent = handoffAgent(handoffSession('session-gc'))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  await requestStep(registered, agent, 1)
+  assert.deepEqual(readdirSync(dir).sort(), [HANDOFF_STATE_FILE, '002.handoff.md'].sort(), 'only the previous fold is kept')
+})
+
+test('the backstop sweep recycles notes older than a week but never a pending one', (t) => {
+  const root = scratchRoot(t)
+  const dir = join(root, 'session-old')
+  mkdirSync(dir, { recursive: true })
+  const stale = join(dir, '001.handoff.md')
+  const fresh = join(dir, '002.handoff.md')
+  writeFileSync(stale, 'x'.repeat(300), 'utf8')
+  writeFileSync(fresh, 'y'.repeat(300), 'utf8')
+  const old = new Date(Date.now() - HANDOFF_MAX_AGE_MS - 86400000)
+  utimesSync(stale, old, old)
+
+  const writeState = (pending) =>
+    writeFileSync(join(dir, HANDOFF_STATE_FILE), JSON.stringify({ version: 1, sessionId: 'session-old', foldNo: 1, pending }), 'utf8')
+
+  // A queued activation still points at the stale note: it must survive.
+  writeState({ path: stale, foldNo: 1, attempts: 0, deliveredAt: null })
+  assert.equal(sweepHandoffs(root, Date.now(), HANDOFF_MAX_AGE_MS), 0)
+  assert.equal(existsSync(stale), true)
+
+  // Delivered: the stale note is fair game, the fresh one is not.
+  writeState({ path: stale, foldNo: 1, attempts: 1, deliveredAt: Date.now() })
+  assert.equal(sweepHandoffs(root, Date.now(), HANDOFF_MAX_AGE_MS), 1)
+  assert.equal(existsSync(stale), false)
+  assert.equal(existsSync(fresh), true)
+
+  // A directory is only pruned when nothing in it — notes or state — has been
+  // touched for the same week: pruning takes the state file with it, and that file
+  // is where a pending activation lives. A unit test caught the hard version of
+  // this by losing its own fixture at load.
+  unlinkSync(fresh)
+  assert.equal(sweepHandoffs(root, Date.now(), HANDOFF_MAX_AGE_MS), 0)
+  assert.equal(existsSync(dir), true, 'a fresh state file keeps its directory alive')
+  const staleState = new Date(Date.now() - HANDOFF_MAX_AGE_MS - 86400000)
+  utimesSync(join(dir, HANDOFF_STATE_FILE), staleState, staleState)
+  assert.equal(sweepHandoffs(root, Date.now(), HANDOFF_MAX_AGE_MS), 0)
+  assert.equal(existsSync(dir), false, 'a directory nobody has touched for the sweep window goes away')
+})
+
+test('handoff_ready refuses everything it cannot honour', async (t) => {
+  const root = scratchRoot(t)
+  const agent = handoffAgent(handoffSession('session-refuse'))
+  const toolFor = (config) => {
+    const { ctx, registered } = stubContext({ used: 600000, compaction: { compactNow: () => Promise.resolve({}) } })
+    apply(ctx, { handoffDir: root, ...config })
+    return registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  }
+
+  // Outside handoff mode the tool exists (so the live switch has something to
+  // switch to) and refuses instead of registering anything.
+  assert.match(toolFor({}).execute({}, { agent }), /only applies in handoff fold mode/)
+
+  const tool = toolFor({ foldMode: 'handoff' })
+  const notePath = handoffPathFor(root, 'session-refuse', 1)
+  assert.match(tool.execute({}, { agent }), /there is no handoff note at/)
+  assert.match(tool.execute({ path: join(root, 'elsewhere', 'note.md') }, { agent }), /not the one this session owns/)
+
+  mkdirSync(join(root, 'session-refuse'), { recursive: true })
+  writeFileSync(notePath, 'too short', 'utf8')
+  assert.match(tool.execute({}, { agent }), new RegExp(`only ${'too short'.length} characters`))
+  assert.equal(handoffFileChars(notePath), 'too short'.length)
+  assert.equal(handoffFileChars(join(root, 'missing.md')), null)
+
+  // The one accepted shape registers the note and says what happens next.
+  writeFileSync(notePath, `# note\n${'x'.repeat(HANDOFF_MIN_CHARS)}`, 'utf8')
+  const ok = tool.execute({}, { agent })
+  assert.match(ok, /✓ handoff registered/)
+  assert.match(ok, /End this round now/)
+  const state = JSON.parse(readFileSync(join(root, 'session-refuse', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.ready.path, notePath)
+  assert.ok(state.ready.chars >= HANDOFF_MIN_CHARS)
+  // Registering twice is not a way to queue two folds.
+  assert.match(tool.execute({}, { agent }), /already queued|✓/)
+})
+
+test('a note registered early waits, and a reading that collapsed releases it', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const folds = []
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-early'))
+  const { ctx, registered } = stubContext({
+    meter,
+    logs,
+    compaction: { compactNow: (...args) => (folds.push(args), Promise.resolve({})) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+  const notePath = handoffPathFor(root, 'session-early', 1)
+  mkdirSync(join(root, 'session-early'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.match(tool.execute({}, { agent }), /✓/)
+
+  // A reading that is merely below the prep point keeps the note for the next end.
+  box.used = 500000
+  await idleBoundary(registered, agent)
+  assert.equal(folds.length, 0)
+  assert.ok(logs.some(([, message]) => String(message).includes('below the prep point')))
+
+  // A reading far below it means somebody else folded: the note was not used.
+  box.used = 200000
+  await idleBoundary(registered, agent)
+  assert.equal(folds.length, 0)
+  assert.ok(logs.some(([, message]) => String(message).includes('folded by something else')))
+  const state = JSON.parse(readFileSync(join(root, 'session-early', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.ready, null, 'the unused note is released, and the next cycle re-preps')
+  assert.equal(state.foldNo, 0)
+})
+
+test('prep reminders are one per turn and capped per cycle', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-budget'))
+  const { ctx, registered } = stubContext({ meter, logs, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, handoffReminders: 2 })
+
+  await requestStep(registered, agent, 1, 1)
+  await requestStep(registered, agent, 1, 2)
+  assert.equal(agent.injected.length, 1, 'one per turn')
+  await requestStep(registered, agent, 2, 1)
+  assert.equal(agent.injected.length, 2, 'a new turn gets one more')
+  await requestStep(registered, agent, 3, 1)
+  assert.equal(agent.injected.length, 2, 'the budget stops the nagging')
+  assert.ok(logs.some(([, message]) => String(message).includes('reminder budget spent')))
 })
