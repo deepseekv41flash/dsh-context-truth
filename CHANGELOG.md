@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.3（未发布）
+## 0.3.3
 
 * **README 记入权限模型带来的限制。** 交接档在 `$DSH_HOME/handoffs/…`，而模型的文件写入受会话权限沙箱约束
   （`@deepseek-ai/dsh-fs-sandbox` 的 `checkedTarget`）：
@@ -8,6 +8,11 @@
   - `workspace-write`：只允许写进会话工作区与系统临时目录，因此仅当工作区是 `$DSH_HOME` 的祖先时交接档才写得进去，
     工作区在别处会被 `FS_SANDBOX_DENIED` 拒绝，插件按预算重试后交给宿主；
   - 两个规避：`handoffDir` 指向工作区内的绝对路径，或指向 `%TEMP%` 下的目录。
+  - 另记一条独立门槛：**自动审查（`auto` 预设 = `danger-full-access` + `ask`）下写档会被审查模型判为 medium**
+    并通常拒绝（medium 要求“当前用户或直接父级明确授权”，而写档指令来自插件注入的 runtime context）；
+    `ask` 下转为一次人工审批，`never` 下终局失败。注册窄写根对该模式无效。
+  - 推荐统一规避：`handoffDir` = `<工作区>/.dsh-handoffs`（工作区内写入在两种受限模式下都算项目内写入，
+    自动审查判 low、必须放行），并加进 `.gitignore`。
   中英 README 各一节，未改代码。
 
 ## 0.3.2

@@ -114,9 +114,12 @@ Guards: at most 3 reminders per cycle; if a round ends past the prep point with 
 - **workspace-write**: writes are allowed only under the **session workspace**, plus the platform temp areas (`/tmp`, `%TEMP%`). The note path is writable only when the workspace is an ancestor of `$DSH_HOME` (for example a workspace of `C:\Users\Admin`); with a workspace elsewhere (`D:\mod`) the write is rejected with `FS_SANDBOX_DENIED`, the plugin re-reminds within its budget and wakes once more at the round end, and then leaves the fold to host pressure;
 - **danger-full-access**: unrestricted.
 
-Two workarounds, both profile configuration:
-1. point `handoffDir` at an **absolute** path inside the workspace — the note then lives in the workspace, contradicting the "never the workspace" default (do not commit it);
-2. point `handoffDir` at the platform temp area (for example `%TEMP%\dsh-handoffs`): under `workspace-write` temp is always writable and the repository stays clean.
+Workarounds, both profile configuration:
+
+1. **The general one: point `handoffDir` at an absolute path inside the workspace** (recommended: `<workspace>/.dsh-handoffs`, added to `.gitignore`). A write inside the workspace counts as an ordinary project-local write in both restricted modes: `workspace-write` allows it, and auto review rates it low, which the policy says **must be allowed** — no human confirmation needed. The cost is that notes live in the workspace, contradicting the "never the workspace" default.
+2. **Only for `workspace-write`: point `handoffDir` at the platform temp area** (for example `%TEMP%\dsh-handoffs`) — temp is always writable there and the repository stays clean, but auto review still treats it as a write outside the project.
+
+**Auto review (the `auto` preset) adds a separate gate.** That preset is `sandbox: danger-full-access` + `approval: ask`: there is no path sandbox at all; instead **every native tool call is reviewed by the same model before it runs**. The review policy rates ordinary project-local reads and writes as low (must be allowed) and non-sensitive writes outside the project as medium, and medium is allowed **only when the current user or a direct parent explicitly authorizes that exact target and scope** — the write instruction comes from the plugin's injected runtime context, not from the user, so it is usually denied: under `approval: ask` the denial turns into one human approval (approve it and the write proceeds), under `never` it is final. Registering a narrow writable root for the session (`sandboxPolicy.registerWritableRoot`) **does not help auto review**: under `danger-full-access` the sandbox never consults writable roots, and the review policy has no "granted directory" tier.
 
 The plugin does not write the note for the model (`handoff_ready` only validates it), so this is a capability boundary of the permission model, not a switch.
 

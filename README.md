@@ -176,11 +176,22 @@ this in as few commands as possible, then a short answer."。数字它读对了�
   交给宿主压力折叠；
 - **完全访问**（`danger-full-access`）：不受限。
 
-两个规避办法（都要改 profile 配置）：
-1. 把 `handoffDir` 设成**绝对路径**并落在工作区内 —— 代价是交接档从此出现在工作区里（与“绝不进工作区”的默认
-   设计相反，注意别把它提交进仓库）；
-2. 把 `handoffDir` 指到系统临时目录下（例如 `%TEMP%\dsh-handoffs`）：`workspace-write` 下临时目录始终可写，
-   也不污染仓库。
+**规避办法**（都要改 profile 配置）：
+
+1. **最通用：把 `handoffDir` 设成工作区内的绝对路径**（推荐 `<工作区>/.dsh-handoffs`，并加进 `.gitignore`）。
+   工作区内的写入在两种受限模式下都算“项目内的普通写入”：`workspace-write` 的沙箱放行，自动审查里属于
+   low（策略规定 low **必须放行**），因此不需要人工确认。代价是交接档出现在工作区里（与“绝不进工作区”的
+   默认设计相反）。
+2. **只对 `workspace-write` 有效：把 `handoffDir` 指到系统临时目录**（例如 `%TEMP%\dsh-handoffs`）——
+   临时目录在 `workspace-write` 下始终可写、也不污染仓库；但自动审查仍会把它看成项目外的写入。
+
+**自动审查（`auto` 预设）另有一条独立的门槛。** 该预设是 `sandbox: danger-full-access` + `approval: ask`：
+文件系统不做路径沙箱，改为**每个原生工具调用前由同一个模型审一次**。审查策略把“项目内的普通读写”定为
+low（必须放行），把“项目外的非敏感写入”定为 medium，而 medium **只有在当前用户或直接父级明确授权了精确
+目标与范围时才放行** —— 写档指令来自插件注入的 runtime context，不是用户指令，所以通常会被判为拒绝：
+`approval: ask` 下会转成一次人工审批（你点批准就写得进去），`never` 下则是终局失败。给会话注册窄目录
+可写根（`sandboxPolicy.registerWritableRoot`）**对自动审查无效**：`danger-full-access` 下沙箱根本不查
+可写根，审查策略里也没有“已授权目录”这一档。
 
 插件不替模型写这份档（`handoff_ready` 只做校验），所以这是权限模型带来的能力边界，不是开关。
 
