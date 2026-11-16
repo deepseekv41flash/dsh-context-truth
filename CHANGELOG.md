@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2
+
+* **注入行按模式说明真正的触发点。** 以前三种模式都只说"宿主自动压缩点 X"——在 `handoff` 下这是错的
+  引导：模型看到 727K 会认为交接档可以晚点写。现在：
+  - `off`：只给宿主点（与旧输出逐字一致）；
+  - `idle`：追加"本插件会在你的回合边界、余量进入 N（窗口的 foldAtIdleMarginPercent%）以内时折叠"；
+  - `handoff`：追加"占用到 N（折叠点的 handoffAt%）时会提醒你写交接档，折叠在那一轮结束时执行"。
+  三者都保留宿主点作为兜底。中英文都覆盖。
+* README 顶部加 npm / license 徽章，顺序与 `dsh-multi-shell`、`dsh-superagent-panel` 一致
+  （标题 → 语言切换 → listed/npm/license 三枚徽章 → 摘要）。
+* 测试：71（新增"注入行按模式给出触发点"用例，中英各断言）。
+
 ## 0.3.1
 
 * **`handoff_ready` 只在 `handoff` 模式下注册。** `off` / `idle` 下它从工具目录里移除（用

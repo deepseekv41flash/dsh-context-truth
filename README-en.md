@@ -93,6 +93,8 @@ the reading parked at "Under 10K tokens of headroom remain"
 
 > Compatibility: a config that never set `foldMode` resolves to `idle` (that is the behaviour this plugin always had, behind `foldAtIdle: true`); a config that explicitly set `foldAtIdle: false` still resolves to `off` and is not dragged along by the new default. An explicit `foldMode` always wins.
 
+The injected occupancy line names **the active mode's own trigger**, not just the host's pressure point: `off` keeps the host point alone; `idle` adds "This plugin folds at your own turn boundary once the headroom comes within 52K"; `handoff` adds "Handoff folding: at 618K (85% of the fold point) you are reminded to write the handoff note; the fold runs at the end of that round". All three keep the host point as the backstop.
+
 #### Handoff folding (`handoff`, experimental)
 
 What actually costs a long task is not the summary but **the repeated work after the fold**: the model cannot know when it will be folded, then rebuilds its picture from the summary and redoes what it already did. Baseline (143 folds): **81 folds (57%) were followed by the model re-reading a file it had just written, 225 occurrences**.

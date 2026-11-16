@@ -301,6 +301,42 @@ test('language and switches are honoured', () => {
   assert.doesNotMatch(rendered, /作废/)
 })
 
+test('the injected line names the fold trigger of the active mode, not only the host point', () => {
+  const reading = {
+    quantized: 150000,
+    used: 150000,
+    window: WINDOW,
+    threshold: THRESHOLD,
+    percent: 15,
+    headroom: THRESHOLD - 150000,
+    headroomRaw: THRESHOLD - 150000,
+    free: WINDOW - 150000,
+    freeRaw: WINDOW - 150000,
+  }
+
+  // `off`: the host owns folding, so the line is exactly the old host-point text.
+  const off = render('ample', reading, resolveOptions({ foldMode: 'off' }))
+  assert.match(off, /Automatic compaction fires at 678K/)
+  assert.doesNotMatch(off, /Handoff folding/)
+  assert.doesNotMatch(off, /turn boundary/)
+
+  // `handoff`: the actionable deadline is the prep point (fold point x handoffAt);
+  // the host point stays as the backstop. 678,464 x 0.85 = 576,694 -> "577K".
+  const handoff = render('ample', reading, resolveOptions({ foldMode: 'handoff' }))
+  assert.match(handoff, /Automatic compaction fires at 678K/)
+  assert.match(handoff, /Handoff folding: at 577K \(85% of the fold point\)/)
+  assert.match(handoff, /the fold runs at the end of that round/)
+  const zhHandoff = render('ample', reading, resolveOptions({ foldMode: 'handoff', language: 'zh' }))
+  assert.match(zhHandoff, /交接式折叠：占用到 577K（折叠点的 85%）/)
+
+  // `idle`: the plugin's own margin, in tokens, is the trigger to name.
+  const idle = render('ample', reading, resolveOptions({ foldMode: 'idle' }))
+  assert.match(idle, /folds at your own turn boundary once the headroom comes within 50K/)
+  assert.doesNotMatch(idle, /Handoff folding/)
+  const zhIdle = render('ample', reading, resolveOptions({ foldMode: 'idle', language: 'zh' }))
+  assert.match(zhIdle, /本插件会在你的回合边界主动折叠：余量进入 50K 以内时执行/)
+})
+
 test('disabled mounts no line, and leaves the other capabilities alone', () => {
   const { ctx, registered } = stubContext({ used: 1000 })
   apply(ctx, { enabled: false, patchCompactionPrompt: false })
