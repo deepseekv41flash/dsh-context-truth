@@ -108,6 +108,18 @@ The chain is:
 
 Guards: at most 3 reminders per cycle; if a round ends past the prep point with no note registered, the plugin **wakes** a round with `followup` to deliver the reminder (dynamic context is only read by requests that actually happen, and a round that ends issues no further request, so the reminder would otherwise wait for a human — measured, and that is why the wake exists); notes are temporary, recycled when the next handoff is created with a 7-day sweep; a registered note whose fold did not happen is kept and never activates a turn.
 
+**Known limitation: session permissions can block the note write.** Notes live under `$DSH_HOME/handoffs/…`, and the host sandboxes model file writes per session permission (`checkedTarget` in `@deepseek-ai/dsh-fs-sandbox`, which checks the target against the writable roots of the resolved mode):
+
+- **read-only**: every mutation is denied, so the model cannot write the note at all; handoff mode degrades to "remind, but never fold" and the host pressure fold takes over;
+- **workspace-write**: writes are allowed only under the **session workspace**, plus the platform temp areas (`/tmp`, `%TEMP%`). The note path is writable only when the workspace is an ancestor of `$DSH_HOME` (for example a workspace of `C:\Users\Admin`); with a workspace elsewhere (`D:\mod`) the write is rejected with `FS_SANDBOX_DENIED`, the plugin re-reminds within its budget and wakes once more at the round end, and then leaves the fold to host pressure;
+- **danger-full-access**: unrestricted.
+
+Two workarounds, both profile configuration:
+1. point `handoffDir` at an **absolute** path inside the workspace — the note then lives in the workspace, contradicting the "never the workspace" default (do not commit it);
+2. point `handoffDir` at the platform temp area (for example `%TEMP%\dsh-handoffs`): under `workspace-write` temp is always writable and the repository stays clean.
+
+The plugin does not write the note for the model (`handoff_ready` only validates it), so this is a capability boundary of the permission model, not a switch.
+
 **Switching modes takes effect immediately, with no restart**: `foldMode` is volatile config, the settings card writes straight into the running reference, and the plugin resolves its options per use (verified live: after the panel switched to `handoff`, the running instance acted on it on its next call). Switching does **not** trigger a fold by itself — the fold still waits for the reading to reach the point.
 
 ## Data sources (all host-measured — nothing is estimated)

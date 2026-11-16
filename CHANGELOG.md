@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.3（未发布）
+
+* **README 记入权限模型带来的限制。** 交接档在 `$DSH_HOME/handoffs/…`，而模型的文件写入受会话权限沙箱约束
+  （`@deepseek-ai/dsh-fs-sandbox` 的 `checkedTarget`）：
+  - `read-only`：拒绝一切写入，模型写不了档，handoff 退化为“只提醒、折不了”，最后由宿主压力折叠接管；
+  - `workspace-write`：只允许写进会话工作区与系统临时目录，因此仅当工作区是 `$DSH_HOME` 的祖先时交接档才写得进去，
+    工作区在别处会被 `FS_SANDBOX_DENIED` 拒绝，插件按预算重试后交给宿主；
+  - 两个规避：`handoffDir` 指向工作区内的绝对路径，或指向 `%TEMP%` 下的目录。
+  中英 README 各一节，未改代码。
+
 ## 0.3.2
 
 * **注入行按模式说明真正的触发点。** 以前三种模式都只说"宿主自动压缩点 X"——在 `handoff` 下这是错的
