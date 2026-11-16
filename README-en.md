@@ -101,7 +101,7 @@ What actually costs a long task is not the summary but **the repeated work after
 
 The chain is:
 
-1. At the **prep point** (`handoffAt` × the fold point, 85% by default) the plugin writes a reminder into the session's **runtime context** (a `systemPrompt` dynamic-context contribution, rendered to the model as a `<system-reminder>` snapshot) naming the **one** allowed note path (`$DSH_HOME/handoffs/<sessionId>/<fold#>.handoff.md`, never the workspace). It renders in exactly the request that published it and is retired before the next request decides anything, so it never poses as a user message, leaves no bubble in the transcript, and is more timely than a queued message (`agent/request` fires before the step's context refresh);
+1. At the **prep point** (`handoffAt` × the fold point, 85% by default) the plugin writes a reminder into the session's **runtime context** (its own `systemPrompt` contribution named `context-truth:handoff`, rendered to the model as a `<system-reminder>` block) naming the **one** allowed note path (`$DSH_HOME/handoffs/<sessionId>/<fold#>.handoff.md`, never the workspace). It renders in exactly the request that published it and is retired before the next request decides anything, so it never poses as a user message, leaves no bubble in the transcript, and is more timely than a queued message (`agent/request` fires before the step's context refresh);
 2. the model writes everything the post-fold self needs (goal, settled decisions, evidence, next action, dead ends) and calls `handoff_ready`;
 3. at the end of that round the plugin calls `compactNow()`;
 4. after the fold it uses `followup` to activate **exactly one** turn whose first instruction is to read that note before touching the task.
@@ -219,7 +219,7 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 ## Verify
 
 ```sh
-npm test          # 72 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
+npm test          # 73 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
 ```
 
 After installing, open a new session and send one message: expanding that turn's runtime context block should show `Context occupancy (host-measured): …`, and the log carries `context-truth: none -> ample (used=… window=1000000 compactionAt=678464)`.
