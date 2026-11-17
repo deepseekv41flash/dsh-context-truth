@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.4（未发布）
+## 0.3.4
 
 * **唤醒消息瘦身：完整提醒改由唤醒轮的 runtime context 承载。** 以前轮末唤醒把整段
   `[handoff fold · prepare]` 塞进一条用户消息（实测 session-36125d3f…：最后一次请求时读数还没越过
@@ -12,6 +12,10 @@
   - 若唤醒轮开始时读数已回落到准备点以下（宿主先折了等），只保留那一行，并记一条
     “wake round … is below the prep point now”日志说明原因。
 * 测试：74（新增“唤醒轮读数已回落时只留一行”用例；三处变异分别失败 1 / 2 / 1 例后逐字节恢复）。
+* **实机演练（2026-11-17 23:48）**：临时把准备点压到 178K、预算提到 5，轮末真实唤醒一次——日志
+  `handoff reminder 5/5 … woke the round`（15:48:14）与 `wake round … published the handoff reminder in
+  runtime context`（15:48:21）成对出现；会话里那条唤醒消息只有一行且含路径，完整清单出现在同一轮的
+  `context-truth:handoff` 块里。演练未写档，因此没有折叠；演练后配置已还原（thresholdRatio 0.8、预算 3）。
 
 ## 0.3.3
 
