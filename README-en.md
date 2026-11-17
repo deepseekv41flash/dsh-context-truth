@@ -106,7 +106,7 @@ The chain is:
 3. at the end of that round the plugin calls `compactNow()`;
 4. after the fold it uses `followup` to activate **exactly one** turn whose first instruction is to read that note before touching the task.
 
-Guards: at most 3 reminders per cycle; if a round ends past the prep point with no note registered, the plugin **wakes** a round with `followup` to deliver the reminder (dynamic context is only read by requests that actually happen, and a round that ends issues no further request, so the reminder would otherwise wait for a human — measured, and that is why the wake exists); notes are temporary, recycled when the next handoff is created with a 7-day sweep; a registered note whose fold did not happen is kept and never activates a turn.
+Guards: at most 3 reminders per cycle; if a round ends past the prep point with no note registered, the plugin **wakes** a round with `followup` (dynamic context is only read by requests that actually happen, and a round that ends issues no further request, so the reminder would otherwise wait for a human — measured, and that is why the wake exists). The wake message is a **single line** naming the note path, and `prepare` re-publishes the full checklist into the runtime-context handoff block of that same request — so the transcript never gets the whole reminder as a user message. If the reading has already dropped below the prep point when the wake round starts (for example the host folded first), only the one-liner remains and the log says why. Notes are temporary, recycled when the next handoff is created with a 7-day sweep; a registered note whose fold did not happen is kept and never activates a turn.
 
 **Known limitation: session permissions can block the note write.** Notes live under `$DSH_HOME/handoffs/…`, and the host sandboxes model file writes per session permission (`checkedTarget` in `@deepseek-ai/dsh-fs-sandbox`, which checks the target against the writable roots of the resolved mode):
 
@@ -234,7 +234,7 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 ## Verify
 
 ```sh
-npm test          # 73 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
+npm test          # 74 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
 ```
 
 After installing, open a new session and send one message: expanding that turn's runtime context block should show `Context occupancy (host-measured): …`, and the log carries `context-truth: none -> ample (used=… window=1000000 compactionAt=678464)`.

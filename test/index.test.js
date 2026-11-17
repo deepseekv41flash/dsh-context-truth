@@ -8,7 +8,7 @@ import { apply, internals, name, inject, Config, CONTEXT_NAME, VARIABLE_NAME, HA
 
 const { resolveOptions, readOccupancy, settleBand, quantize, quantizeHeadroom, headroomDisplayStep, render, patchCompactionInstruction, patchCompactionRequest, isCompactionRequest, isTaggedCompactionRequest, messageText, DEFAULT_OPTIONS, DEFAULT_COMPACTION_RULES, PACE_LADDER, median, nextPaceState, samplePace, paceSteps, paceRung, settlePace, paceSentence, tightClause, foldClause, shouldFoldAtIdle, backendIdentity } = internals
 
-const { resolveFoldMode, handoffTrigger, handoffRoot, handoffPathFor, handoffPrepMessage, handoffActivationMessage, handoffReapable, sweepHandoffs, handoffFileChars, safeSegment, sessionIdOf, isDelegate, samePath, HANDOFF_TOOL_NAME, HANDOFF_MIN_CHARS, HANDOFF_MAX_AGE_MS, HANDOFF_STATE_FILE } = internals
+const { resolveFoldMode, handoffTrigger, handoffRoot, handoffPathFor, handoffPrepMessage, handoffWakeMessage, handoffActivationMessage, handoffReapable, sweepHandoffs, handoffFileChars, safeSegment, sessionIdOf, isDelegate, samePath, HANDOFF_TOOL_NAME, HANDOFF_MIN_CHARS, HANDOFF_MAX_AGE_MS, HANDOFF_STATE_FILE } = internals
 
 /** A 1M window reserving the DeepSeek adapter's default 256K completion tokens. */
 const WINDOW = 1000000
@@ -1430,6 +1430,13 @@ test('the prep point is a fraction of the fold point, and only handoff mode prep
   const enPrep = handoffPrepMessage({ path, trigger, recycled: 0, options: enOptions })
   assert.ok(enPrep.includes(path))
   assert.match(enPrep, /temporary file/)
+  const enWake = handoffWakeMessage({ path, options: enOptions })
+  assert.match(enWake, /\[handoff fold · wake\]/)
+  assert.ok(enWake.includes(path), 'the wake line still names the exact path')
+  assert.ok(!enWake.includes('Write a handoff note for the post-fold you'), 'the wake line is not the checklist')
+  const zhWake = handoffWakeMessage({ path, options: zhOptions })
+  assert.match(zhWake, /交接式折叠 · 唤醒/)
+  assert.ok(zhWake.includes(path))
   const enActivation = handoffActivationMessage({ path, foldNo: 1, options: enOptions })
   assert.ok(enActivation.includes(path))
   assert.match(enActivation, /only auto-activated turn/)
@@ -1547,12 +1554,17 @@ test('a round that ends past the prep point wakes one reminder turn, bounded by 
   await idleBoundary(registered, agent)
   assert.equal(agent.followed.length, 1)
 
-  // The wake round starts: the wake message IS this round's reminder, so neither
-  // channel may stack a second copy in it.
+  // The wake round starts: its message is a one-liner, and the checklist rides
+  // that round's runtime-context block instead of the transcript.
+  const wake = agent.followed[0].content[0].text
+  assert.match(wake, /\[handoff fold · wake\]/)
+  assert.ok(!wake.includes('Write a handoff note for the post-fold you'), 'the checklist must not travel as a message')
+  assert.ok(wake.includes(handoffPathFor(root, 'session-nonote', 1)), 'the one-liner still names the path')
   await requestStep(registered, agent, 2)
-  assert.doesNotMatch(handoffBlock(registered, agent), /handoff fold · prepare/, 'no duplicate reminder in the wake round')
+  assert.match(handoffBlock(registered, agent), /handoff fold · prepare/, 'the wake round carries the full reminder in runtime context')
+  assert.ok(handoffBlock(registered, agent).includes('Write a handoff note for the post-fold you'))
   await requestStep(registered, agent, 2, 2)
-  assert.doesNotMatch(handoffBlock(registered, agent), /handoff fold · prepare/, 'and none on a later step of the same wake round')
+  assert.doesNotMatch(handoffBlock(registered, agent), /handoff fold · prepare/, 'and it is retired on the next request')
   assert.equal(agent.injected.length, 0)
 
   // Still no note: the budget allows one more wake, then it stops.
@@ -1563,6 +1575,29 @@ test('a round that ends past the prep point wakes one reminder turn, bounded by 
   assert.equal(agent.followed.length, 2, 'the reminder budget must cap the wakes')
   assert.equal(folds.length, 0)
   assert.ok(logs.some(([, message]) => String(message).includes('budget spent')))
+})
+
+test('a wake round that is no longer past the point keeps only its one-liner', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-late'))
+  const { ctx, registered } = stubContext({ meter, logs, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  await requestStep(registered, agent, 1)
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 1, 'the round was woken')
+
+  // Something else folded first, or the reading collapsed: the wake round must not
+  // carry a reminder for a fold that is no longer due.
+  box.used = 100000
+  await requestStep(registered, agent, 2)
+  assert.doesNotMatch(handoffBlock(registered, agent), /handoff fold · prepare/, 'no reminder below the point')
+  assert.ok(
+    logs.some(([, message]) => String(message).includes('below the prep point now')),
+    'the degraded wake round says why',
+  )
 })
 
 test('a failed fold keeps the note and activates nothing', async (t) => {
