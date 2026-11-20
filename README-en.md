@@ -123,6 +123,8 @@ Why reduced: a child's turns belong to whoever delegated it, and injecting one w
 
 The fold is detected from the reading, not from a counter: a registered note plus a reading below **90% of the reading it was registered at**. A reading only drops when somebody rewrites the window; a few percent is a trim (a tool catalog coming and going, `defer_loading`) and is not treated as a fold — otherwise a child would be sent to read a note it does not need yet.
 
+One timing detail: the reminder is published inside `agent/request`, and that step's runtime-context snapshot is already materialized by then, so the model reads it on its **next** step. That is invisible for a root session (rounds have several steps); a child whose turn is a single step reads the post-fold pointer when its parent next calls it — measured that way, and nothing is lost.
+
 **Known limitation: session permissions can block the note write.** Notes live under `$DSH_HOME/handoffs/…`, and the host sandboxes model file writes per session permission (`checkedTarget` in `@deepseek-ai/dsh-fs-sandbox`, which checks the target against the writable roots of the resolved mode):
 
 - **read-only**: every mutation is denied, so the model cannot write the note at all; handoff mode degrades to "remind, but never fold" and the host pressure fold takes over;
