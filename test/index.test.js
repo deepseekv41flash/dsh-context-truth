@@ -8,7 +8,7 @@ import { apply, internals, name, inject, Config, CONTEXT_NAME, VARIABLE_NAME, HA
 
 const { resolveOptions, readOccupancy, settleBand, quantize, quantizeHeadroom, headroomDisplayStep, render, patchCompactionInstruction, patchCompactionRequest, isCompactionRequest, isTaggedCompactionRequest, messageText, DEFAULT_OPTIONS, DEFAULT_COMPACTION_RULES, PACE_LADDER, median, nextPaceState, samplePace, paceSteps, paceRung, settlePace, paceSentence, tightClause, foldClause, shouldFoldAtIdle, backendIdentity } = internals
 
-const { resolveFoldMode, handoffTrigger, handoffRoot, handoffPathFor, handoffPrepMessage, handoffWakeMessage, handoffActivationMessage, handoffReapable, sweepHandoffs, handoffFileChars, safeSegment, sessionIdOf, isDelegate, samePath, HANDOFF_TOOL_NAME, HANDOFF_MIN_CHARS, HANDOFF_MAX_AGE_MS, HANDOFF_STATE_FILE } = internals
+const { resolveFoldMode, handoffTrigger, handoffRoot, handoffPathFor, handoffPrepMessage, handoffDelegatePrepMessage, handoffDelegateFoldMessage, handoffWakeMessage, handoffActivationMessage, handoffReapable, sweepHandoffs, handoffFileChars, safeSegment, sessionIdOf, isDelegate, samePath, HANDOFF_TOOL_NAME, HANDOFF_MIN_CHARS, HANDOFF_MAX_AGE_MS, HANDOFF_STATE_FILE } = internals
 
 /** A 1M window reserving the DeepSeek adapter's default 256K completion tokens. */
 const WINDOW = 1000000
@@ -1716,6 +1716,202 @@ test('a delegated session is never prepared, registered, or folded', async (t) =
   await idleBoundary(registered, agent)
   assert.equal(folds.length, 0)
   assert.equal(isDelegate(handoffSession('root', { depth: 0 })), false)
+})
+
+test('the delegate variant is off by default, and off means off', async (t) => {
+  // 子代理变体是可选行为：默认配置下委派会话的提示词必须逐字节不变。
+  const root = scratchRoot(t)
+  const { meter } = movableMeter(630000)
+  const agent = handoffAgent(handoffSession('session-child-off', { depth: 1 }))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+
+  assert.equal(DEFAULT_OPTIONS.subagentHandoff, false, 'a new behaviour ships off')
+  assert.equal(resolveOptions({}).subagentHandoff, false)
+  assert.equal(resolveOptions(Config({ subagentHandoff: true })).subagentHandoff, true, 'the form can turn it on')
+
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+  await requestStep(registered, agent, 1)
+  assert.equal(handoffBlock(registered, agent), '', 'the default config keeps a delegate silent')
+})
+
+test('a delegate is reminded past the prep point, and its note file is the registration', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(620000)
+  const folds = []
+  const agent = handoffAgent(handoffSession('session-child-prep', { depth: 1 }))
+  const { ctx, registered } = stubContext({
+    meter,
+    compaction: { compactNow: (...args) => (folds.push(args), Promise.resolve({})) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, subagentHandoff: true })
+
+  const notePath = handoffPathFor(root, 'session-child-prep', 1)
+  await requestStep(registered, agent, 1)
+  const block = handoffBlock(registered, agent)
+  assert.match(block, /handoff fold · subagent prepare/)
+  assert.ok(block.includes(notePath), 'the one allowed path is spelled out')
+  assert.match(block, /Writing the file is the whole registration/)
+  assert.doesNotMatch(block, /follow-up turn is activated/, 'the root promise would be a lie for a child')
+  assert.equal(agent.injected.length, 0, 'a delegate is never addressed as the human')
+  assert.equal(agent.followed.length, 0, 'and never woken: its turns belong to whoever delegated it')
+
+  // 拒答也必须可执行：子会话没有 handed_ready 可用，要求调用等于把提醒变成死路。
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.match(tool.execute({}, { agent }), /writing the note file IS the registration/, 'a refused call says what to do instead')
+
+  // 写文件 = 登记。
+  mkdirSync(join(root, 'session-child-prep'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  await requestStep(registered, agent, 1)
+  assert.equal(handoffBlock(registered, agent), '', 'the note on disk ends the reminder')
+  const state = JSON.parse(readFileSync(join(root, 'session-child-prep', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.ready.path, notePath)
+  assert.equal(state.ready.used, 620000, 'the reading is kept as the fold baseline')
+  assert.equal(state.reminders, 1)
+
+  // 待写的档已经在盘上：下一轮即使仍在准备点以上，也不能再发第二条提醒。
+  box.used = 630000
+  await requestStep(registered, agent, 2)
+  assert.equal(handoffBlock(registered, agent), '', 'a pending note owns the next reminder slot')
+
+  await idleBoundary(registered, agent)
+  assert.equal(folds.length, 0, 'nothing here folds a delegate')
+})
+
+test('after the host folds a delegate, the next request points it back at its note', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(620000)
+  const agent = handoffAgent(handoffSession('session-child-fold', { depth: 1 }))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, subagentHandoff: true })
+
+  const notePath = handoffPathFor(root, 'session-child-fold', 1)
+  await requestStep(registered, agent, 1)
+  mkdirSync(join(root, 'session-child-fold'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  await requestStep(registered, agent, 1)
+
+  box.used = 210000
+  await requestStep(registered, agent, 2)
+  const block = handoffBlock(registered, agent)
+  assert.match(block, /handoff fold · subagent, after the fold/)
+  assert.ok(block.includes(notePath), 'the pointer names the file the child wrote')
+  const state = JSON.parse(readFileSync(join(root, 'session-child-fold', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 1, 'the cycle is counted, so the next note is 002')
+  assert.equal(state.ready, null)
+  assert.equal(state.reminders, 0)
+  assert.equal(agent.followed.length, 0, 'the pointer rides a turn the parent already caused; nothing is woken')
+
+  await requestStep(registered, agent, 2)
+  assert.equal(handoffBlock(registered, agent), '', 'the pointer is one-shot, like every other block')
+})
+
+test('a small drop is a trim, not a fold', async (t) => {
+  // 只有当窗口被人重写过，reading 才会掉下来；掉 3% 是工具目录/defer 之类的小抖动，
+  // 把它当折叠会让孩子去读一份它还不需要的档。
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(620000)
+  const agent = handoffAgent(handoffSession('session-child-trim', { depth: 1 }))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, subagentHandoff: true })
+
+  const notePath = handoffPathFor(root, 'session-child-trim', 1)
+  await requestStep(registered, agent, 1)
+  mkdirSync(join(root, 'session-child-trim'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  await requestStep(registered, agent, 1)
+
+  box.used = 600000
+  await requestStep(registered, agent, 2)
+  assert.equal(handoffBlock(registered, agent), '', 'a reading below the prep point but not halved is not a fold')
+  const state = JSON.parse(readFileSync(join(root, 'session-child-trim', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 0)
+  assert.equal(state.ready.path, notePath, 'the note stays registered and waiting')
+})
+
+test('a note found below the prep point after a restart still gets its pointer', async (t) => {
+  // 状态里没有读数基线（旧版本写的，或选项刚打开），而读数已经在准备点以下：
+  // 唯一合理的解释是折叠已经发生。不能因为“没有基线”就把孩子丢在摘要里。
+  const root = scratchRoot(t)
+  const dir = join(root, 'session-child-late')
+  mkdirSync(dir, { recursive: true })
+  const notePath = handoffPathFor(root, 'session-child-late', 1)
+  writeFileSync(notePath, 'late note', 'utf8')
+  writeFileSync(
+    join(dir, HANDOFF_STATE_FILE),
+    JSON.stringify({ version: 1, sessionId: 'session-child-late', foldNo: 0, ready: { path: notePath, chars: 9, at: 1 } }),
+    'utf8',
+  )
+  const { meter } = movableMeter(300000)
+  const agent = handoffAgent(handoffSession('session-child-late', { depth: 1 }))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, subagentHandoff: true })
+
+  await requestStep(registered, agent, 1)
+  const block = handoffBlock(registered, agent)
+  assert.match(block, /handoff fold · subagent, after the fold/)
+  assert.ok(block.includes(notePath))
+  const state = JSON.parse(readFileSync(join(dir, HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 1)
+  assert.equal(state.ready, null)
+})
+
+test('after the fold the next note is numbered up, and the pointed-at note survives', async (t) => {
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(620000)
+  const agent = handoffAgent(handoffSession('session-child-numbered', { depth: 1 }))
+  const { ctx, registered } = stubContext({ meter, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, subagentHandoff: true })
+
+  const first = handoffPathFor(root, 'session-child-numbered', 1)
+  await requestStep(registered, agent, 1)
+  mkdirSync(join(root, 'session-child-numbered'), { recursive: true })
+  writeFileSync(first, `# note\n${'x'.repeat(400)}`, 'utf8')
+  await requestStep(registered, agent, 1)
+  box.used = 210000
+  await requestStep(registered, agent, 2)
+
+  box.used = 630000
+  await requestStep(registered, agent, 3)
+  const block = handoffBlock(registered, agent)
+  assert.ok(block.includes(handoffPathFor(root, 'session-child-numbered', 2)), 'the next note is 002')
+  assert.equal(existsSync(first), true, 'the note the fold pointer aimed at is kept, exactly like an activation target')
+  assert.equal(agent.followed.length, 0)
+})
+
+test('delegate reminders are one per turn and capped per cycle, and never wake', async (t) => {
+  const root = scratchRoot(t)
+  const { meter } = movableMeter(640000)
+  const logs = []
+  const agent = handoffAgent(handoffSession('session-child-budget', { depth: 1 }))
+  const { ctx, registered } = stubContext({ meter, logs, compaction: { compactNow: () => Promise.resolve({}) } })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, subagentHandoff: true })
+
+  const reminded = []
+  for (const turn of [1, 1, 2, 3, 4]) {
+    await requestStep(registered, agent, turn)
+    if (handoffBlock(registered, agent).includes('subagent prepare')) reminded.push(turn)
+  }
+  assert.deepEqual(reminded, [1, 2, 3], 'one per turn, three per cycle')
+  assert.equal(agent.followed.length, 0, 'a delegate is never woken, whatever the budget says')
+  assert.ok(
+    logs.some(([, message]) => String(message).includes('delegate handoff reminder budget spent')),
+    'the budget stop is logged',
+  )
+})
+
+test('the delegate messages exist in both languages', () => {
+  const trigger = { prepare: true, used: 620000, threshold: 727040, point: 618000, headroom: 107040 }
+  const zh = handoffDelegatePrepMessage({ path: 'C:/x/001.handoff.md', trigger, recycled: 0, options: { language: 'zh' } })
+  assert.match(zh, /子代理准备/)
+  assert.ok(zh.includes('C:/x/001.handoff.md'))
+  assert.match(zh, /文件本身就是登记/)
+
+  const en = handoffDelegatePrepMessage({ path: 'C:/x/001.handoff.md', trigger, recycled: 2, options: { language: 'en' } })
+  assert.match(en, /recycled 2 older note file/)
+
+  assert.match(handoffDelegateFoldMessage({ path: 'C:/x/001.handoff.md', options: { language: 'zh' } }), /子代理折叠后/)
+  assert.match(handoffDelegateFoldMessage({ path: 'C:/x/001.handoff.md', options: { language: 'en' } }), /subagent, after the fold/)
 })
 
 test('the activation target survives the prep that hands out the next note', async (t) => {

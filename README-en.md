@@ -108,6 +108,21 @@ The chain is:
 
 Guards: at most 3 reminders per cycle; if a round ends past the prep point with no note registered, the plugin **wakes** a round with `followup` (dynamic context is only read by requests that actually happen, and a round that ends issues no further request, so the reminder would otherwise wait for a human — measured, and that is why the wake exists). The wake message is a **single line** naming the note path, and `prepare` re-publishes the full checklist into the runtime-context handoff block of that same request — so the transcript never gets the whole reminder as a user message. If the reading has already dropped below the prep point when the wake round starts (for example the host folded first), only the one-liner remains and the log says why. Notes are temporary, recycled when the next handoff is created with a 7-day sweep; a registered note whose fold did not happen is kept and never activates a turn.
 
+#### Notes in delegated sessions (`subagentHandoff`, off by default)
+
+The root-session handoff leans on two things a child does not have: this plugin performs the fold, and this plugin opens the activation turn. A child therefore gets a reduced shape, not the same one:
+
+| | Root session | Delegated session (`subagentHandoff: true`) |
+|---|---|---|
+| Reminder | ✅ runtime-context block | ✅ the same block and the same budget (once per turn, `handoffReminders` per cycle) |
+| Registration | call `handoff_ready` | **writing the file is the registration** (`handoff_ready` refuses a delegated session by design) |
+| Fold | the plugin runs it at the round end | ❌ the host runs it at the pressure point; the plugin only watches |
+| After the fold | `followup` activates exactly one turn | ❌ a pointer to that path, delivered on the next request its parent causes |
+
+Why reduced: a child's turns belong to whoever delegated it, and injecting one would break the parent's sequencing. Why still worth doing: upstream merged agent teams into subagents, so children are now resumable, addressable colleagues with longer lives; 8 of 116 delegated sessions on this host (6.9%) were folded at least once, and after such a fold the parent keeps addressing a child that only remembers a summary.
+
+The fold is detected from the reading, not from a counter: a registered note plus a reading below **90% of the reading it was registered at**. A reading only drops when somebody rewrites the window; a few percent is a trim (a tool catalog coming and going, `defer_loading`) and is not treated as a fold — otherwise a child would be sent to read a note it does not need yet.
+
 **Known limitation: session permissions can block the note write.** Notes live under `$DSH_HOME/handoffs/…`, and the host sandboxes model file writes per session permission (`checkedTarget` in `@deepseek-ai/dsh-fs-sandbox`, which checks the target against the writable roots of the resolved mode):
 
 - **read-only**: every mutation is denied, so the model cannot write the note at all; handoff mode degrades to "remind, but never fold" and the host pressure fold takes over;
@@ -191,6 +206,7 @@ Capability 3 resolves its engine itself, at fold time, through a **ranked candid
 | `handoffAt` | `0.85` | Prep point for the handoff reminder, as a fraction of the **fold point** (not the window) |
 | `handoffDir` | `''` | Note directory; empty means `$DSH_HOME/handoffs`, a relative path also resolves under `$DSH_HOME`, never the workspace |
 | `handoffReminders` | `3` | Reminders per cycle, wake included |
+| `subagentHandoff` | `false` | Remind delegated sessions too: the file is the registration, no wake, no fold, and after the fold only a pointer back (see above) |
 | `foldAtIdle` | `false` | Legacy switch, equivalent to `foldMode: idle`; an explicit `false` means `off`. Only matters for a config that never set `foldMode` |
 | `foldAtIdleMarginPercent` | `5` | Fold once the headroom is within this percent of the window (50K on a 1M window) |
 | `foldAtIdleMethod` | `auto` | Channel for the request: `auto` runs the session's own `/compact` first (realm view), then falls back to the ranked service chain; `command` / `service` force one. `service` is the most predictable of the two (this profile uses it) |
@@ -234,7 +250,7 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 ## Verify
 
 ```sh
-npm test          # 74 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
+npm test          # 82 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), notes in delegated sessions (the file as the registration, fold detection, the pointer back, off by default), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
 ```
 
 After installing, open a new session and send one message: expanding that turn's runtime context block should show `Context occupancy (host-measured): …`, and the log carries `context-truth: none -> ample (used=… window=1000000 compactionAt=678464)`.
