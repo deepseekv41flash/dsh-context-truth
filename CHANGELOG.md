@@ -33,6 +33,15 @@
      `delegate … was folded since it wrote …`，`foldNo` 0→1、`ready` 清空、`reminders` 归零；
   5. 子会话的下一次请求逐字报回 `[handoff fold · subagent, after the fold]` 首行与路径。
   全程没有 `followup`、没有折叠（该子会话的每一次被唤醒都来自父代理的 `send_message`）。
+* **真实宿主折叠也补上了（同日 20:13–20:14，生产会话而非演练）**：另一个会话里已有的子代理
+  `f664ed48`（当时 65%）拿到提醒是 20:10:10.816 `delegate handoff prep 1/3 (used=683623 of 727040)`，
+  它写了 5,594 字符的档（基线 `ready.used=691627`）；读数在 20:13:36.158 越过折叠点
+  （`tight -> critical (used=727843 … compactionAt=727040)`，超出 803 tokens），宿主随即折叠
+  （`compaction/start` 20:13:36 → `compaction/end` 20:14:00，`compaction (step pressure): shadowed 427
+  surface nodes (seqs 12-1189, ~339405 tokens)`）；20:14:00.241 插件判折叠并登记
+  `used=392118, registered at=691627, cause=reading dropped`；20:14:09 那条指回提示只投递一次，
+  **子会话折叠后的第一个动作就是 `read` 自己的档**（20:14:10），随后在同一轮里继续干活——没有唤醒。
+  这是该子会话的第一次折叠（此前 0 次），也是本能力唯一一次"提醒 → 写档 → 真实折叠 → 指回 → 读档"全真链路。
 * **顺带纠正一条 0.3.2 写错的时序**：runtime context 快照是在该步的 `agent/request` 瀑布**之前**物化的，
   所以"在这条瀑布里发布的提醒由同一个请求渲染"是错的——它由**下一个**请求渲染（证据：19:50:08.943 发布，
   19:50:11 的快照才带上它）。多步轮次不受影响；对"一轮只有一步"的子会话意味着轮末发布的折叠后标记要等
