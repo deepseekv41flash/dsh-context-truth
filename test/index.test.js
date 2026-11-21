@@ -1523,6 +1523,132 @@ test('handoff mode folds at the round end and activates exactly one turn', async
   assert.ok(state.pending.deliveredAt > 0)
 })
 
+test('a fold through the real /compact contract activates the post-fold turn', async (t) => {
+  // 宿主契约：`dsh-commands` 的 `settle()` 返回 `Object.freeze({ commandId, result })`，
+  // 所以 `sourceEventSeq` 在 `result` 里，不在 `execute()` 的返回值上。0.4.0 之前按扁平读，
+  // 于是每一次成功折叠都被判成“没有可折叠范围” → handoff 从不激活（现场 session b28499cb，
+  // 2026-11-22 01:22：`/compact` 真的折了 1295 条 / ~506k tokens，state.json 仍是 foldNo 0）。
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(500000)
+  const executions = []
+  const logs = []
+  const commands = {
+    execute: (...args) => {
+      executions.push(args)
+      // 与现场 `command/done` 逐字一致的两层形状。
+      return Promise.resolve({
+        commandId: 'cmd-repro-1',
+        result: {
+          kind: 'success',
+          text: 'Compacted 1295 history items (~506473 tokens).',
+          sourceEventSeq: 3436,
+        },
+      })
+    },
+  }
+  const agent = handoffAgent(handoffSession('session-contract'))
+  // 现场是 stock 部署：只有命令通道可用，没有任何 compaction 服务可注入。
+  const { ctx, registered } = stubContext({ meter, commands, logs })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  const notePath = handoffPathFor(root, 'session-contract', 1)
+  box.used = 600000
+  await requestStep(registered, agent, 2, 1)
+  assert.ok(handoffBlock(registered, agent).includes(notePath), 'the reminder names the path')
+
+  mkdirSync(join(root, 'session-contract'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.match(tool.execute({ path: notePath }, { agent }), /handoff registered/)
+
+  await idleBoundary(registered, agent)
+
+  assert.equal(executions.length, 1, 'the fold must go through the command channel')
+  assert.equal(executions[0][1], '/compact', 'the fold is the session\'s own /compact')
+  assert.deepEqual(executions[0][2], [], 'submitted attachments must be an empty list')
+  assert.ok(executions[0][3] !== undefined, 'the command must receive an abort signal')
+  assert.equal(
+    agent.followed.length,
+    1,
+    `the post-fold turn must be activated (logs: ${JSON.stringify(logs.map((entry) => entry.slice(0, 2)))})`,
+  )
+  assert.ok(agent.followed[0].content[0].text.includes(notePath), 'the activation points at the note')
+
+  const state = JSON.parse(readFileSync(join(root, 'session-contract', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 1, 'the fold must be recorded')
+  assert.equal(state.ready, null, 'the registered note must be consumed')
+  assert.ok(state.pending !== null && state.pending.deliveredAt !== null, 'the activation must be marked delivered')
+})
+
+test('an unregistered /compact falls back to the compaction service instead of answering "no range"', async (t) => {
+  // `dsh-commands.execute()` 对“命令没注册/语法不认识”是 resolve undefined，不 throw。
+  // 只有 throw 才回退 → realm 里没有 /compact 的部署上，`auto` 的第二条腿是死的。
+  const root = scratchRoot(t)
+  const { meter } = movableMeter(600000)
+  const folds = []
+  const logs = []
+  const commands = { execute: () => Promise.resolve(undefined) }
+  const session = handoffSession('session-fallback')
+  const agent = handoffAgent(session)
+  const { ctx, registered } = stubContext({
+    meter,
+    commands,
+    logs,
+    compaction: { compactNow: (...args) => (folds.push(args), Promise.resolve({ shadowedSeqs: [1] })) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  const notePath = handoffPathFor(root, 'session-fallback', 1)
+  await requestStep(registered, agent, 2, 1)
+  mkdirSync(join(root, 'session-fallback'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  assert.match(tool.execute({ path: notePath }, { agent }), /handoff registered/)
+
+  await idleBoundary(registered, agent)
+
+  assert.equal(folds.length, 1, 'the service channel must be reached after an unresolved /compact')
+  assert.equal(agent.followed.length, 1, 'and the activation still happens')
+  assert.ok(
+    logs.some(([, message]) => String(message).includes('falling back to the compaction service')),
+    'the fallback is logged, not silent',
+  )
+})
+
+test('a refused /compact keeps the note, activates nothing, and warns', async (t) => {
+  const root = scratchRoot(t)
+  const { meter } = movableMeter(600000)
+  const logs = []
+  const commands = {
+    execute: () => Promise.resolve({ commandId: 'cmd-1', result: { kind: 'error', text: 'session is busy' } }),
+  }
+  const agent = handoffAgent(handoffSession('session-refused'))
+  const { ctx, registered } = stubContext({ meter, commands, logs })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root })
+
+  const notePath = handoffPathFor(root, 'session-refused', 1)
+  await requestStep(registered, agent, 2, 1)
+  mkdirSync(join(root, 'session-refused'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  tool.execute({ path: notePath }, { agent })
+
+  await idleBoundary(registered, agent)
+
+  assert.equal(agent.followed.length, 0, 'a refusal must not activate a turn')
+  const state = JSON.parse(readFileSync(join(root, 'session-refused', HANDOFF_STATE_FILE), 'utf8'))
+  assert.equal(state.foldNo, 0)
+  assert.equal(state.ready.path, notePath, 'the note survives for the next round end')
+  assert.ok(
+    logs.some(([level, message]) => level === 'warn' && String(message).includes('the fold did not commit')),
+    'the consequence is a warn, not an info line among the happy-path noise',
+  )
+  assert.ok(
+    logs.some(([, message, , kind, text]) => String(message).includes('/compact did not fold') && kind === 'error' && text === 'session is busy'),
+    'the refusal kind and text are preserved',
+  )
+})
+
 test('a round that ends past the prep point wakes one reminder turn, bounded by the budget', async (t) => {
   const root = scratchRoot(t)
   const { box, meter } = movableMeter(600000)

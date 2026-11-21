@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.1
+
+* **修 `handoff` 模式折叠后从不激活轮次：命令通道读错了宿主的返回值形状。** 现场（Linux，stock 部署，
+  realm 里没有可注入的 `compaction` 服务，命令通道是唯一能折的路）：`/compact` 真的折了 1295 条 /
+  ~506,473 tokens，`command/done` 明确 `{kind: "success", sourceEventSeq: 3436}`，但会话停在 idle，
+  **没有激活轮**，`state.json` 停在 `foldNo: 0 / ready 未消费 / pending: null`。
+  根因：`dsh-commands` 的 `settle()` 返回 `Object.freeze({ commandId, result })`（类型 `CommandExecution`），
+  `sourceEventSeq` 在 `result` 里；`requestFold()` 直接读 `execution.sourceEventSeq`，恒为 `undefined`，
+  于是每次成功折叠都被判成"没有可折叠范围"（`folded: false`）→ 不记 `foldNo`、不建 `pending`、不 `followup`。
+* 一处修三件事（`requestFold` 的命令分支）：
+  1. 解包 `execution.result`（新增 `commandResultOf()`，同时兼容直接返回 `CommandResult` 的桩/老宿主）；
+  2. `execute()` 对"命令未注册"是 **resolve `undefined`**，不是 throw（`dsh-commands`：
+     `if (parsed === void 0) return void 0`），而旧代码只在 catch 里回退服务通道 → 文档承诺的
+     "先命令、再服务"在没有 `/compact` 的 realm 上是死的；现在 `undefined` 明确走回退并记日志，
+     `foldAtIdleMethod: command` 时则记"不允许其它通道"；
+  3. `kind: error` / `cancelled` 的拒绝与"没有可折叠范围"分开记日志（带 `kind` 与原文）；折叠未提交时，
+     消费者按 `error` 记 `warn`、其余记 `info`，并写明 `reason`。
+* **为什么过去的演练没抓到**：本仓库 profile 用 `foldAtIdleMethod: service`，0.3.x 的激活演练全部走服务通道
+  （判定只需 `compactNow()` 非 null，天然正确）。命令分支是 0.3.0（`e3318ab`）引入的，而 `dsh-commands`
+  从 0.2.0-rc.2 起就是两层形状 —— **命令分支上线第一天起判定就恒为 false**，只是从没人走过这条路。
+  这次把"命令通道也必须激活"变成回归用例，不再依赖演练选哪条通道。
+* 测试：85（新增 3 条：真实两层契约必须激活；`execute` resolve `undefined` 必须回退服务并激活；
+  `kind: error` 必须保留档、不激活、记 `warn`）。三处变异分别失败 2 / 1 / 1 例，隔离副本按字节恢复。
+* 顺带更正 `thresholdRatio` 的注释：原文把 0.7 写成"本 profile 跑 dsh-dcp"的事实，而现场那台机器并没有该包；
+  改为说明 0.7 是 dsh-dcp 的取值、stock 是 0.8，应按实际挂载的引擎设置。
+* ⚠ 命令通道的实机验收要等重启（HMR 缺陷 #13623 让 link 插件的源码改动只能靠重启生效）；本机待做，
+  现场（Linux）需 `npm i dsh-context-truth@0.4.1` 后重启复验 `foldNo: 1` + 激活轮。
+
 ## 0.4.0
 
 * **委派会话（子代理）也能写交接档了：`subagentHandoff`，默认关。** 动机是量出来的，不是猜的：

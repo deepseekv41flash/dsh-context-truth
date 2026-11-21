@@ -108,6 +108,8 @@ The chain is:
 
 Guards: at most 3 reminders per cycle; if a round ends past the prep point with no note registered, the plugin **wakes** a round with `followup` (dynamic context is only read by requests that actually happen, and a round that ends issues no further request, so the reminder would otherwise wait for a human — measured, and that is why the wake exists). The wake message is a **single line** naming the note path, and `prepare` re-publishes the full checklist into the runtime-context handoff block of that same request — so the transcript never gets the whole reminder as a user message. If the reading has already dropped below the prep point when the wake round starts (for example the host folded first), only the one-liner remains and the log says why. Notes are temporary, recycled when the next handoff is created with a 7-day sweep; a registered note whose fold did not happen is kept and never activates a turn.
 
+The command channel decides "did it fold" from the host's own shape: `commands.execute()` resolves `CommandExecution = { commandId, result }`, so the evidence is `execution.result.sourceEventSeq`. Before 0.4.1 the plugin read `execution.sourceEventSeq` (always `undefined`), so on that channel **a successful fold never activated the post-fold turn** — on a stock deployment (no injectable `compaction` service in the realm) that reads as "it folded but no turn ever follows". A realm without `/compact` makes `execute()` resolve `undefined` instead of throwing; that case now falls back to the compaction service explicitly instead of being taken for "no compactable range".
+
 #### Notes in delegated sessions (`subagentHandoff`, off by default)
 
 The root-session handoff leans on two things a child does not have: this plugin performs the fold, and this plugin opens the activation turn. A child therefore gets a reduced shape, not the same one:
@@ -252,7 +254,7 @@ What you get for it: the model stops halting or handing off because it *thinks* 
 ## Verify
 
 ```sh
-npm test          # 82 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake), notes in delegated sessions (the file as the registration, fold detection, the pointer back, off by default), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
+npm test          # 85 unit tests: banding, hysteresis, quantization, free window, fold definition, idle fold and its guards, live settings changes, schema-default parity, pace estimate, degradation, directive patching, look-alike rejection, idempotence, handoff folding (reminder, registration, round-end fold, single activation, restart recovery, recycling, round-end wake, the command channel's real contract and its fallback), notes in delegated sessions (the file as the registration, fold detection, the pointer back, off by default), client card shape, the handoff reminder travelling in runtime context rather than as a message, and a live mode switch dropping it
 ```
 
 After installing, open a new session and send one message: expanding that turn's runtime context block should show `Context occupancy (host-measured): …`, and the log carries `context-truth: none -> ample (used=… window=1000000 compactionAt=678464)`.
