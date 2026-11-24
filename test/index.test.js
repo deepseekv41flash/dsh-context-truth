@@ -1649,6 +1649,47 @@ test('a refused /compact keeps the note, activates nothing, and warns', async (t
   )
 })
 
+test('the activation rides runtime context, so a round opened by somebody else still sees it', async (t) => {
+  // 现场（session-c5d0874b，2026-11-24）：折叠 23:16:04 结束，目标续跑在同一秒开了新轮，
+  // 而 followup 里那段激活说明直到 23:17:22 才落进那一轮 —— 晚了 78 秒，排在 Objective 之后，
+  // 读起来只是脚注。所以说明必须走 runtime-context 通道：下一个请求无论是谁开的都能渲染。
+  const root = scratchRoot(t)
+  const { box, meter } = movableMeter(600000)
+  const agent = handoffAgent(handoffSession('session-goalround'))
+  const { ctx, registered } = stubContext({
+    meter,
+    compaction: { compactNow: () => Promise.resolve({ shadowedSeqs: [1] }) },
+  })
+  apply(ctx, { foldMode: 'handoff', handoffDir: root, language: 'zh' })
+
+  const notePath = handoffPathFor(root, 'session-goalround', 1)
+  await requestStep(registered, agent, 1)
+  mkdirSync(join(root, 'session-goalround'), { recursive: true })
+  writeFileSync(notePath, `# note\n${'x'.repeat(400)}`, 'utf8')
+  const tool = registered.tools.find((definition) => definition.name === HANDOFF_TOOL_NAME)
+  tool.execute({ path: notePath }, { agent })
+
+  await idleBoundary(registered, agent)
+  assert.equal(agent.followed.length, 1, 'the wake still opens a round when nobody else does')
+
+  // 折叠刚结束、任何新请求之前：完整说明已经在通道里，等着被哪个请求渲染都行。
+  const block = handoffBlock(registered, agent)
+  assert.match(block, /唯一一次自动激活/, 'the block carries the checklist, not just the path')
+  assert.ok(block.includes(notePath))
+  assert.match(block, /如果这一轮不是你打开的/, 'it yields to a foreign round without losing the order')
+
+  // 唤醒消息只负责开轮：一行入口 + 路径，不把整段说明再抄一遍。
+  const wake = agent.followed[0].content[0].text
+  assert.ok(wake.includes(notePath), 'the wake names the path')
+  assert.doesNotMatch(wake, /不要重新推导/, 'the checklist must not be duplicated into the message')
+
+  // 谁开的那一轮先到，就在它的第一个请求里渲染；渲染过一次即退役。
+  // 折叠后读数下掉（真实折叠就是这样），所以这一轮也不该再出现准备提醒。
+  box.used = 100000
+  await requestStep(registered, agent, 2)
+  assert.equal(handoffBlock(registered, agent), '', 'the activation block is one-shot')
+})
+
 test('a round that ends past the prep point wakes one reminder turn, bounded by the budget', async (t) => {
   const root = scratchRoot(t)
   const { box, meter } = movableMeter(600000)
